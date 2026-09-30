@@ -1,0 +1,14 @@
+# build output and make stamps
+build/
+assets/.generated
+
+# toolchain downloaded by `make toolchain`
+tools/bin/
+tools/vendor/
+
+# Python / OS noise
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store

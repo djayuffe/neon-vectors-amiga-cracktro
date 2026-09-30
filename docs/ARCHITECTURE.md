@@ -1,0 +1,103 @@
+# Architecture
+
+## Target
+
+A **PAL OCS/ECS, 68000** production. The 320×256 display window, the 50 Hz tracker tick and the
+frame-sync line are PAL-specific. It makes no claim about NTSC timing; on a 262-line frame it
+does not hang but is mistimed (see "Frame pipeline").
+
+## Startup and ownership
+
+1. Save all CPU registers (`movem.l d0-d7/a0-a6`).
+2. Open `graphics.library` with `OldOpenLibrary` (name in `a1`). Save `GfxBase->ActiView`
+   (offset 34) and `GfxBase->copinit` (offset 38), the system Copper start list. `COP1LC` is
+   write-only and cannot be read back, so `copinit` is the documented source.
+3. Allocate, verify, copy and re-base the chip-RAM payload (next section). This happens with
+   interrupts still enabled because `AllocMem` must not be called under `Disable()`.
+4. `LoadView(NULL)`, two `WaitTOF`, `OwnBlitter`, `WaitBlit` — still with interrupts on, since
+   `WaitTOF` depends on the vertical-blank interrupt.
+5. Snapshot `DMACONR`, `INTENAR`, `ADKCONR`.
+6. `Forbid()` then `Disable()`, in that order.
+7. Clear `INTENA`/`INTREQ`, stop all DMA, clear all `ADKCON` bits.
+8. Initialise screen, logo, stars, Copper pointers and the MOD player; install the Copper list
+   and enable master + bitplane + Copper DMA. **Audio DMA stays off** — a channel enabled
+   before it has a sample would play 128 KB of memory as noise; each channel is switched on by
+   the first note that uses it.
+
+On exit: stop Paula, mask interrupts and stop all DMA, `LoadView(old view)`, point `COP1LC` at
+`copinit` and strobe `COPJMP1`, `Enable()` then `Permit()`, two `WaitTOF`, `DisownBlitter`,
+restore `ADKCON`/`INTENA`/`DMACON` from the snapshots as SET writes, free the chip block, close
+the library and restore all registers. Return code 0 (20 if startup failed).
+
+Why BPLCON0/1/2 and the modulos are not restored by hand: `LoadView` and the restarted system
+Copper list write them on the next frame; a value captured while another View was active is
+not a safer source.
+
+## Chip memory and re-basing
+
+Copper, bitplanes and Paula DMA must be in chip RAM. With `-kick1hunks` the loader may place
+the hunk in ordinary memory, so the program does the work itself:
+
+1. `AllocMem(d0 = size, d1 = MEMF_CHIP)` for the whole contiguous payload block.
+2. `TypeOfMem(a1 = block)` to confirm chip RAM; otherwise `FreeMem` and fail with code 20.
+3. `CopyMem(a0 = source, a1 = dest, d0 = size)`.
+4. Rewrite each of the eight longwords in `reloc_table` as `base + (assembled − block start)`.
+
+The block holds, in order, the Copper list, three bitplanes, logo, font, the `$8080` silence
+word and the MOD. Code reaches them only through `ptr_screen`, `ptr_logo`, `ptr_font`,
+`ptr_silence`, `ptr_mod`, `ptr_copper`, `ptr_cop_bpl1` and `ptr_raster` (slots in
+`reloc_table`). A direct reference to one of those labels would keep pointing at the loaded
+hunk, so `tools/validate.py` rejects it, and the emulation test verifies that the original
+hunk is never modified.
+
+All other data (saved registers, tables, the MOD player state) lives in an ordinary data hunk
+and is addressed absolutely; the hunk loader relocates those references. PC-relative addressing
+cannot reach another hunk and can never be a destination, so it is not used for data.
+
+## Copper list
+
+A sequence of `MOVE` register/value pairs ending with the `$FFFF,$FFFE` stall. From `cop_bpl1`
+the six bitplane-pointer pairs put the register words at byte offsets 0/4/8/12/16/20 and the
+data words that `PatchCopper` writes at 2/6, 10/14 and 18/22.
+
+A WAIT is two words: position with bit 0 set, then mask with bit 0 clear and bit 15 set
+(blitter-finished ignored). `$8001,$FFFE` waits for line 128; the next waits are lines 136, 144,
+152, 160 and 168. `cop_raster_color` is the `COLOR00` pair at line 128 that `UpdateRaster`
+overwrites once per frame.
+
+## Frame pipeline
+
+`BeamLine` reads `VPOSR` and `VHPOSR` with a single long access (they are adjacent, so the pair
+cannot straddle a line change) and returns the 9-bit line number in `d0`. `WaitFrameSync`
+first leaves the sync zone, then waits for line ≥ 300, the first line below the display window
+(`DIWSTOP` = line 300). One iteration of the main loop therefore equals one PAL frame, giving a
+50 Hz tick rate on both the 312- and 313-line frames. Each iteration runs, in order:
+
+1. `MOD_Tick` — one tracker tick (a row every 6 ticks);
+2. `UpdateRaster` — rewrites the animated `COLOR00` slot;
+3. `UpdateStars` — erase all 32 stars, advance and redraw;
+4. `UpdateScroller` — every second frame, shift the band one pixel and insert a column;
+5. test the left mouse button.
+
+The work lands in the ≈56 lines between line 300 and the top of the next display window. Measured
+on the emulated CPU it averages ≈17 000 cycles and peaks at ≈22 000 against a window of
+≈25 400 cycles (DMA contention not modelled). If the beam wraps before line 300 is reached — a
+262-line NTSC frame — the wait ends at the wrap instead of hanging with interrupts disabled.
+
+## Display
+
+- 320×256 low resolution PAL, three contiguous 10 240-byte bitplanes, 40 bytes per line, zero modulo
+- Plane 0: logo (lines 48–111); plane 1: scroller (lines 210–225); plane 2: stars (lines 128–191)
+- Copper-programmed DIW/DDF, bitplane pointers, palette and raster colour changes
+
+## Constraints
+
+No OS calls occur in the running loop. Drawing is CPU-side; the blitter is only owned so that no
+other task can use it. No interrupt handlers are installed. Only 68000 instructions and
+addressing modes are used. Branches are not forced short.
+
+## Audio ownership
+
+The intro takes Paula exclusively and leaves audio DMA off on exit: the previous audio-DMA state
+cannot be restored against changed channel registers without risking noise, so the restored
+`DMACON` mask (`DMAF_SYSTEM`, `$07F0`) excludes the four audio bits.

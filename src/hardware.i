@@ -1,0 +1,102 @@
+; ---------------------------------------------------------------------------
+; NEON VECTORS - OCS/ECS custom register offsets and AmigaOS library offsets.
+;
+; Every constant below is a documented hardware register offset or a Kickstart
+; library vector offset (LVO). Library call sites use the LVO_* names instead of
+; raw negative displacements so a transposed call cannot be written by accident.
+;
+; Register conventions used by the call sites (from the Exec/graphics autodocs):
+;   OldOpenLibrary(a1=name, d0=version)   CloseLibrary(a1=library)
+;   AllocMem(d0=size, d1=flags)           FreeMem(a1=block, d0=size)
+;   TypeOfMem(a1=address)                 CopyMem(a0=source, a1=dest, d0=size)
+;   LoadView(a1=view)                     the library base is always in a5/a6
+; ---------------------------------------------------------------------------
+
+CUSTOM      EQU $DFF000
+
+DMACONR     EQU $002       ; read: active DMA, write: same bits as DMACON (CLR)
+VPOSR       EQU $004       ; bit15 LOF, bit0 V8
+VHPOSR      EQU $006       ; bits15-8 V7..V0, bits7-0 H8..H1
+ADKCONR     EQU $010
+INTENAR     EQU $01C
+INTREQR     EQU $01E
+COP1LCH     EQU $080
+COP1LCL     EQU $082
+COPJMP1     EQU $088
+COPJMP2     EQU $08A
+DIWSTRT     EQU $08E
+DIWSTOP     EQU $090
+DDFSTRT     EQU $092
+DDFSTOP     EQU $094
+DMACON      EQU $096
+INTENA      EQU $09A
+INTREQ      EQU $09C
+ADKCON      EQU $09E
+AUD0LCH     EQU $0A0
+AUD0LEN     EQU $0A4       ; the four Paula channels are 16 bytes apart
+AUD0PER     EQU $0A6
+AUD0VOL     EQU $0A8
+AUD1LCH     EQU $0B0
+AUD2LCH     EQU $0C0
+AUD3LCH     EQU $0D0
+BPL1PTH     EQU $0E0
+BPL1PTL     EQU $0E2
+BPL2PTH     EQU $0E4
+BPL2PTL     EQU $0E6
+BPL3PTH     EQU $0E8
+BPL3PTL     EQU $0EA
+BPLCON0     EQU $100
+BPLCON1     EQU $102
+BPLCON2     EQU $104
+BPL1MOD     EQU $108
+BPL2MOD     EQU $10A
+COLOR00     EQU $180
+CIAAPRA     EQU $BFE001
+
+; DMACONR/DMACON enable bits (hardware/dmabits.h): audio 0-3, disk 4,
+; sprite 5, blitter 6, copper 7, bitplane (raster) 8, master (DMAEN) 9,
+; blitter-priority 10. Bits 13/14 of DMACONR are the read-only BZERO/BBUSY.
+DMAF_SETCLR  EQU $8000
+DMAF_AUDIO   EQU $000F
+DMAF_DISK    EQU $0010
+DMAF_SPRITE  EQU $0020
+DMAF_BLITTER EQU $0040
+DMAF_COPPER  EQU $0080
+DMAF_RASTER  EQU $0100
+DMAF_MASTER  EQU $0200
+DMAF_BLITHOG EQU $0400
+DMAF_ALL     EQU $07FF      ; every allocatable DMA channel
+DMAF_SYSTEM  EQU $07F0      ; everything except audio 0-3, restored on exit
+
+; Exec.library library vector offsets.
+LVO_Disable       EQU -120
+LVO_Enable        EQU -126
+LVO_Forbid        EQU -132
+LVO_Permit        EQU -138
+LVO_AllocMem      EQU -198
+LVO_FreeMem       EQU -210
+LVO_CopyMem       EQU -624
+LVO_OldOpenLibrary EQU -408
+LVO_CloseLibrary  EQU -414
+LVO_TypeOfMem     EQU -534
+
+; graphics.library library vector offsets.
+LVO_LoadView      EQU -222
+LVO_WaitBlit      EQU -228
+LVO_WaitTOF       EQU -270
+LVO_OwnBlitter    EQU -456
+LVO_DisownBlitter EQU -462
+
+; GfxBase positive offsets.
+GfxBase_ActiView  EQU 34
+GfxBase_copinit   EQU 38
+
+; AllocMem requirement flags.
+MEMF_ANY   EQU $00008000
+MEMF_CHIP  EQU $00000002
+MEMF_FAST  EQU $00000004
+MEMF_CLEAR EQU $00010000
+
+; AmigaDOS return codes.
+RETURN_OK   EQU 0
+RETURN_FAIL EQU 20
