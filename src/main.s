@@ -4,13 +4,34 @@ SCREEN_W_BYTES  EQU 40
 SCREEN_H        EQU 256
 PLANE_SIZE      EQU SCREEN_W_BYTES*SCREEN_H
 PLANE_LONGS     EQU PLANE_SIZE/4
-SCROLL_Y        EQU 210
-SCROLL_H        EQU 16
+SCREEN_LONGS    EQU PLANE_LONGS*4
 CHIPDATA_SIZE   EQU chipdata_end-chipdata_begin
-LOGO_Y          EQU 48
-LOGO_H          EQU 64
 FRAME_SYNC_LINE EQU 300     ; first line below the display window (DIWSTOP = line 300)
 SILENCE_WORD    EQU $8080   ; 8 bit Paula silence is unsigned $80, not 0
+
+; Screen layout (lines are screen rows; display line = row + 44).
+LOGO_Y          EQU 8       ; 64 line logo band
+LOGO_H          EQU 64
+MID_Y0          EQU 76      ; stars and wireframe live in rows 76..195
+MID_H           EQU 120
+MID_CX          EQU 160
+MID_CY          EQU 136
+SCROLL_Y        EQU 200     ; 16 line scroller strip
+SCROLL_H        EQU 16
+
+; Starfield: NSTARS points with (x, y, z); z runs from ZMAX down to ZMIN and wraps.
+NSTARS          EQU 64
+STAR_SIZE       EQU 10      ; x.w y.w z.w offset.w mask.b class.b
+ZMIN            EQU 32
+ZRANGE          EQU 224
+ZSPEED          EQU 2
+ZMID            EQU 150     ; z <= ZMID: mid distance;  z <= ZNEAR: near
+ZNEAR           EQU 80
+PROJ_F          EQU 128     ; star projection scale
+
+; Wireframe: 7-bit sine table, perspective D/(z+ZOFF).
+WIRE_D          EQU 220
+WIRE_ZOFF       EQU 300
 
 ; Runtime pointer slots. AllocChipMem copies the whole data_c block into chip
 ; RAM and rewrites every one of these long words to point into the copy, so no
@@ -90,26 +111,31 @@ _start:
         move.l  ptr_copper,d0
         move.l  d0,COP1LCH(a6)
         move.w  #0,COPJMP1(a6)
-; Audio DMA stays off here: a channel enabled before MOD_Row has loaded its
+; Blitter DMA is on for the wireframe. Audio DMA stays off here: a channel enabled before MOD_Row has loaded its
 ; location and length would play 128 KB of arbitrary memory as noise. Each
 ; channel is switched on by its first note.
-        move.w  #(DMAF_SETCLR|DMAF_MASTER|DMAF_RASTER|DMAF_COPPER),DMACON(a6)
+        move.w  #(DMAF_SETCLR|DMAF_MASTER|DMAF_RASTER|DMAF_COPPER|DMAF_BLITTER),DMACON(a6)
 
 ; --- main loop --------------------------------------------------------------
 ; One iteration per PAL frame: WaitFrameSync returns as the beam leaves the
 ; display window, so everything drawn below lands in the frame shown next.
 .main:
         bsr     WaitFrameSync
+        bsr     BlitWait                   ; last frame's wireframe blits must be finished
+        bsr     WireSwap                   ; show the buffer drawn last frame
         bsr     MOD_Tick
         bsr     UpdateRaster
         bsr     UpdateStars
         bsr     UpdateScroller
+        bsr     DrawWire                   ; draw the next frame into the hidden buffer
         btst    #6,CIAAPRA                 ; left mouse button, active low
         bne     .main
 
 ; --- teardown ---------------------------------------------------------------
 ; Stop the demo first, then hand the View back, then the Copper: LoadView only
 ; installs the View, it does not restart the system Copper list.
+        lea     CUSTOM,a6
+        bsr     BlitWait                   ; no blit may still be writing chip RAM
         bsr     MOD_Stop
         lea     CUSTOM,a6
         move.w  #$7FFF,INTENA(a6)
@@ -287,7 +313,7 @@ WaitLines:
 ClearScreen:
         move.l  ptr_screen,a0
         moveq   #0,d0
-        move.w  #PLANE_LONGS*3-1,d7
+        move.w  #SCREEN_LONGS-1,d7
 .cs:
         move.l  d0,(a0)+
         dbra    d7,.cs
@@ -306,23 +332,35 @@ DrawLogo:
 ; Rewrite the three bitplane pointer pairs in the copied Copper list. The list is
 ; stored as MOVE pairs, so the register words sit at byte offsets 0/4/8/12/16/20
 ; and the data words that PatchCopper overwrites at 2/6, 10/14 and 18/22.
+; The screen block holds plane 0, wireframe buffer 0, wireframe buffer 1 and
+; plane 2, in that order; plane 1 of the display is whichever wireframe buffer is
+; currently in front.
 PatchCopper:
         move.l  ptr_cop_bpl1,a1
-        move.l  ptr_screen,d0
-        move.l  d0,d3
+        move.l  ptr_screen,d3
+        move.l  d3,d0
         move.w  d0,6(a1)                   ; BPL1PTL
         swap    d0
         move.w  d0,2(a1)                   ; BPL1PTH
-        move.l  d3,d0
-        addi.l  #PLANE_SIZE,d0
+        moveq   #0,d0
+        move.w  wire_front,d0
+        addq.w  #1,d0
+        mulu    #PLANE_SIZE,d0
+        add.l   d3,d0
         move.w  d0,14(a1)                  ; BPL2PTL
         swap    d0
         move.w  d0,10(a1)                  ; BPL2PTH
         move.l  d3,d0
-        addi.l  #PLANE_SIZE*2,d0
+        addi.l  #PLANE_SIZE*3,d0
         move.w  d0,22(a1)                  ; BPL3PTL
         swap    d0
         move.w  d0,18(a1)                  ; BPL3PTH
+        rts
+
+; Flip the wireframe buffers and point the Copper at the one drawn last frame.
+WireSwap:
+        eori.w  #1,wire_front
+        bsr     PatchCopper
         rts
 
 ; ---------------------------------------------------------------------------
@@ -342,83 +380,150 @@ UpdateRaster:
         rts
 
 ; ---------------------------------------------------------------------------
-; Stars. Each entry is the x coordinate and the byte offset of its fixed row
-; (y * 40); the byte within the row follows x, so a star drifts across the
-; screen one pixel per frame.
+; 3D starfield. Each star is (x, y, z); z falls by ZSPEED per frame and the star
+; is projected as screen = centre + coordinate * PROJ_F / z, so near stars move
+; faster and further from the centre than far ones. When z reaches ZMIN the star
+; is sent to the back with a new x and y.
+;
+; Depth is shown with brightness, using the planes that are free in the middle
+; band: far = plane 2 only, mid = plane 0 only, near = planes 0 and 2. The
+; palette turns those three combinations into three brightnesses.
+;
+; Every star remembers the byte offset, bit mask and class (bit 0 = plane 2,
+; bit 1 = plane 0) it was drawn with, so the next frame erases exactly that.
 ; ---------------------------------------------------------------------------
+Rand:                                      ; 16 bit LCG; result in d0.w
+        move.w  rng_seed,d0
+        mulu    #25173,d0
+        addi.l  #13849,d0
+        move.w  d0,rng_seed
+        rts
+
 InitStars:
-        lea     stars,a0
-        moveq   #0,d0
-        moveq   #31,d7
+        move.w  #1,rng_seed
+        lea     stars,a2
+        moveq   #NSTARS-1,d7
 .is:
-        move.w  d0,(a0)+                   ; x
-        move.w  d0,d1
-        mulu    #37,d1
-        andi.w  #63,d1
-        addi.w  #128,d1                    ; y = 128..191
-        mulu    #SCREEN_W_BYTES,d1         ; byte offset of the start of line y
-        move.w  d1,(a0)+                   ; row offset; StarAddress adds x/8
-        add.w   #73,d0
-        cmp.w   #320,d0
-        blo     .isok
-        subi.w  #320,d0
-.isok:
+        bsr     Rand
+        andi.w  #511,d0
+        subi.w  #255,d0
+        move.w  d0,(a2)                    ; x -255..256
+        bsr     Rand
+        andi.w  #255,d0
+        subi.w  #128,d0
+        muls    #5,d0
+        asr.l   #3,d0
+        move.w  d0,2(a2)                   ; y -80..79
+        bsr     Rand
+        andi.w  #255,d0
+        mulu    #ZRANGE,d0
+        lsr.l   #8,d0
+        addi.w  #ZMIN,d0
+        move.w  d0,4(a2)                   ; z ZMIN..ZMIN+ZRANGE-1
+        clr.w   6(a2)
+        clr.b   8(a2)
+        clr.b   9(a2)                      ; nothing drawn yet
+        lea     STAR_SIZE(a2),a2
         dbra    d7,.is
         rts
 
-; Erase every star at its current x, then advance and draw them: two stars that
-; share a byte and a bit in the same frame must not cancel each other out. The
-; stored x is always the x that was drawn, so the next frame erases exactly that
-; pixel. The bit mask is built with data register shifts and applied with a
-; read/modify/write through a data register.
 UpdateStars:
-        move.l  ptr_screen,a0
-        adda.l  #PLANE_SIZE*2,a0           ; plane 2
-        lea     stars,a1
-        moveq   #31,d7
-.us_er:
-        bsr     StarAddress
-        move.b  (a2),d3
+        move.l  ptr_screen,a0              ; plane 0
+        lea     PLANE_SIZE*3(a0),a1        ; plane 2
+        lea     stars,a2
+; Erase every star at its remembered position first, so two stars sharing a
+; byte cannot cancel each other's pixel.
+        moveq   #NSTARS-1,d7
+.er:
+        move.b  9(a2),d0
+        beq     .ernext
+        move.w  6(a2),d2
+        move.b  8(a2),d1
         not.b   d1
-        and.b   d1,d3
-        move.b  d3,(a2)
-        addq.l  #4,a1
-        dbra    d7,.us_er
+        btst    #0,d0
+        beq     .er0
+        and.b   d1,0(a1,d2.w)
+.er0:
+        btst    #1,d0
+        beq     .er1
+        and.b   d1,0(a0,d2.w)
+.er1:
+        clr.b   9(a2)
+.ernext:
+        lea     STAR_SIZE(a2),a2
+        dbra    d7,.er
 
-        lea     stars,a1
-        moveq   #31,d7
-.us_dr:
-        move.w  (a1),d0
-        addq.w  #1,d0
+        lea     stars,a2
+        lea     recip_star,a3
+        moveq   #NSTARS-1,d7
+.dr:
+        move.w  4(a2),d3
+        subq.w  #ZSPEED,d3
+        cmp.w   #ZMIN,d3
+        bge     .zok
+        addi.w  #ZRANGE,d3                 ; back to the far end, new lane
+        bsr     Rand
+        andi.w  #511,d0
+        subi.w  #255,d0
+        move.w  d0,(a2)
+        bsr     Rand
+        andi.w  #255,d0
+        subi.w  #128,d0
+        muls    #5,d0
+        asr.l   #3,d0
+        move.w  d0,2(a2)
+.zok:
+        move.w  d3,4(a2)
+        move.w  d3,d6
+        add.w   d6,d6
+        move.w  0(a3,d6.w),d6              ; PROJ_F * 256 / z
+        move.w  (a2),d0
+        muls    d6,d0
+        asr.l   #8,d0                      ; x * PROJ_F / z
+        addi.w  #MID_CX,d0                 ; screen x
         cmp.w   #320,d0
-        blo     .xok
-        clr.w   d0
-.xok:
-        move.w  d0,(a1)                    ; store the new x before it is drawn
-        bsr     StarAddress
-        move.b  (a2),d3
-        or.b    d1,d3
-        move.b  d3,(a2)
-        addq.l  #4,a1
-        dbra    d7,.us_dr
-        rts
-
-; in: a0 = plane base, a1 points at one star entry;
-; out: a2 = the star byte, d1 = its bit mask. a0 must survive: the caller loops
-; over all 32 stars with one base, so the offset is addressed instead of added
-; to a0, which would walk a0 off the end of the bitplane.
-StarAddress:
-        move.w  (a1),d3
-        move.w  d3,d2
-        lsr.w   #3,d2                      ; x / 8
-        add.w   2(a1),d2                   ; + row offset
-        lea     0(a0,d2.w),a2
-        andi.w  #7,d3
-        moveq   #7,d1
-        sub.w   d3,d1                      ; bit number, MSB first
-        moveq   #1,d0
-        lsl.w   d1,d0
-        move.w  d0,d1
+        bhs     .skip                      ; unsigned: also catches negative x
+        move.w  2(a2),d1
+        muls    d6,d1
+        asr.l   #8,d1
+        addi.w  #MID_CY,d1                 ; screen y
+        move.w  d1,d2
+        subi.w  #MID_Y0,d2
+        cmp.w   #MID_H,d2
+        bhs     .skip
+        mulu    #SCREEN_W_BYTES,d1
+        move.w  d0,d2
+        lsr.w   #3,d2
+        add.w   d2,d1                      ; byte offset of the star
+        move.w  d1,6(a2)
+        andi.w  #7,d0
+        moveq   #7,d2
+        sub.w   d0,d2                      ; bit number, MSB first
+        moveq   #1,d4
+        lsl.b   d2,d4                      ; mask
+        move.b  d4,8(a2)
+        moveq   #3,d5                      ; near
+        cmp.w   #ZNEAR,d3
+        ble     .cls
+        moveq   #2,d5                      ; mid
+        cmp.w   #ZMID,d3
+        ble     .cls
+        moveq   #1,d5                      ; far
+.cls:
+        move.b  d5,9(a2)
+        btst    #0,d5
+        beq     .d0
+        or.b    d4,0(a1,d1.w)
+.d0:
+        btst    #1,d5
+        beq     .dnext
+        or.b    d4,0(a0,d1.w)
+        bra     .dnext
+.skip:
+        clr.b   9(a2)
+.dnext:
+        lea     STAR_SIZE(a2),a2
+        dbra    d7,.dr
         rts
 
 ; ---------------------------------------------------------------------------
@@ -439,7 +544,7 @@ UpdateScroller:
         clr.b   scroll_div
 
         move.l  ptr_screen,a0
-        adda.l  #PLANE_SIZE+(SCROLL_Y*SCREEN_W_BYTES),a0
+        adda.l  #SCROLL_Y*SCREEN_W_BYTES,a0
         moveq   #SCROLL_H-1,d7
 .sc_row:
         lea     SCREEN_W_BYTES-4(a0),a4    ; last longword of the row
@@ -484,7 +589,7 @@ UpdateScroller:
         moveq   #7,d2
         sub.w   d1,d2                      ; bit of this column inside the byte
         move.l  ptr_screen,a0
-        adda.l  #PLANE_SIZE+(SCROLL_Y*SCREEN_W_BYTES)+SCREEN_W_BYTES-1,a0
+        adda.l  #(SCROLL_Y*SCREEN_W_BYTES)+SCREEN_W_BYTES-1,a0
         moveq   #7,d7
 .sc_glyph:                                 ; every font row is drawn on two lines
         move.b  (a2)+,d3
@@ -502,6 +607,316 @@ UpdateScroller:
 .done:
         rts
 
+; ---------------------------------------------------------------------------
+; Wireframe. A cube (objects' vertices 0..7) and an octahedron (8..13) rotate in
+; opposite directions. Each frame: the hidden buffer's band is cleared by the
+; blitter while the CPU builds the rotation matrices and projects the vertices,
+; then every edge is drawn with the blitter in line mode. The buffer becomes
+; visible only after WireSwap, so the picture never shows a half-drawn frame.
+; ---------------------------------------------------------------------------
+BlitWait:                                  ; a6 = CUSTOM
+        btst    #6,DMACONR(a6)             ; dummy read: older Agnus revisions need it
+.w:
+        btst    #6,DMACONR(a6)             ; BBUSY
+        bne     .w
+        rts
+
+DrawWire:
+        lea     CUSTOM,a6
+        move.l  ptr_screen,a0
+        moveq   #0,d0
+        move.w  wire_front,d0
+        eori.w  #1,d0                      ; the hidden buffer
+        addq.w  #1,d0
+        mulu    #PLANE_SIZE,d0
+        adda.l  d0,a0                      ; a0 = hidden wireframe buffer
+
+        bsr     BlitWait
+        move.w  #$0100,BLTCON0(a6)         ; D only, minterm 0: clear
+        move.w  #0,BLTCON1(a6)
+        move.w  #0,BLTDMOD(a6)
+        lea     MID_Y0*SCREEN_W_BYTES(a0),a1
+        move.l  a1,BLTDPTH(a6)
+        move.w  #(MID_H<<6)|(SCREEN_W_BYTES/2),BLTSIZE(a6)
+
+        addq.w  #1,ang_x
+        addq.w  #2,ang_y
+        addq.w  #1,ang_z
+        lea     proj,a3
+; Cube: angles (x, y, z).
+        move.w  ang_x,d0
+        move.w  ang_y,d1
+        move.w  ang_z,d2
+        bsr     CalcMatrix
+        lea     verts,a1
+        moveq   #8-1,d7
+        bsr     TransformVerts
+; Octahedron turns the other way.
+        move.w  ang_z,d0
+        add.w   d0,d0
+        move.w  ang_x,d1
+        neg.w   d1
+        move.w  ang_y,d2
+        neg.w   d2
+        bsr     CalcMatrix
+        moveq   #6-1,d7
+        bsr     TransformVerts             ; a1 continues at the octahedron vertices
+
+        bsr     BlitWait                   ; the clear must be done before lines go in
+        move.w  #SCREEN_W_BYTES,BLTCMOD(a6)    ; registers every line shares: set once
+        move.w  #SCREEN_W_BYTES,BLTDMOD(a6)
+        move.w  #$8000,BLTADAT(a6)
+        move.w  #$FFFF,BLTBDAT(a6)
+        move.w  #$FFFF,BLTAFWM(a6)
+        move.w  #$FFFF,BLTALWM(a6)
+        lea     proj,a3
+        lea     edges,a4
+        lea     edges_end,a5
+.edge:
+        moveq   #0,d4
+        move.b  (a4)+,d4
+        lsl.w   #2,d4
+        move.w  0(a3,d4.w),d0
+        move.w  2(a3,d4.w),d1
+        moveq   #0,d4
+        move.b  (a4)+,d4
+        lsl.w   #2,d4
+        move.w  0(a3,d4.w),d2
+        move.w  2(a3,d4.w),d3
+        bsr     BlitLine
+        cmpa.l  a5,a4
+        blo     .edge
+        rts
+
+; (d0.w * d1.w) >> 7, result in d0. Used for the 7 bit fixed point matrix.
+Mul7:
+        muls    d1,d0
+        asr.l   #7,d0
+        rts
+
+; in: d0 = angle x, d1 = angle y, d2 = angle z (0..255 is a full turn)
+; out: mat[0..8] = Rz * Ry * Rx, scaled by 128.  Clobbers d0-d2, a2, a4 (a1 and a3 are
+; the caller's vertex pointers and must survive).
+CalcMatrix:
+        lea     sintab,a4
+        andi.w  #255,d0
+        add.w   d0,d0
+        move.w  0(a4,d0.w),sx
+        addi.w  #128,d0                    ; +64 entries of 2 bytes: cosine
+        andi.w  #511,d0
+        move.w  0(a4,d0.w),cx
+        andi.w  #255,d1
+        add.w   d1,d1
+        move.w  0(a4,d1.w),sy
+        addi.w  #128,d1
+        andi.w  #511,d1
+        move.w  0(a4,d1.w),cy
+        andi.w  #255,d2
+        add.w   d2,d2
+        move.w  0(a4,d2.w),sz
+        addi.w  #128,d2
+        andi.w  #511,d2
+        move.w  0(a4,d2.w),cz
+        lea     mat,a2
+; m00 = cz*cy
+        move.w  cz,d0
+        move.w  cy,d1
+        bsr     Mul7
+        move.w  d0,(a2)
+; m01 = cz*sy*sx - sz*cx
+        move.w  cz,d0
+        move.w  sy,d1
+        bsr     Mul7
+        move.w  sx,d1
+        bsr     Mul7
+        move.w  d0,d2
+        move.w  sz,d0
+        move.w  cx,d1
+        bsr     Mul7
+        sub.w   d0,d2
+        move.w  d2,2(a2)
+; m02 = cz*sy*cx + sz*sx
+        move.w  cz,d0
+        move.w  sy,d1
+        bsr     Mul7
+        move.w  cx,d1
+        bsr     Mul7
+        move.w  d0,d2
+        move.w  sz,d0
+        move.w  sx,d1
+        bsr     Mul7
+        add.w   d0,d2
+        move.w  d2,4(a2)
+; m10 = sz*cy
+        move.w  sz,d0
+        move.w  cy,d1
+        bsr     Mul7
+        move.w  d0,6(a2)
+; m11 = sz*sy*sx + cz*cx
+        move.w  sz,d0
+        move.w  sy,d1
+        bsr     Mul7
+        move.w  sx,d1
+        bsr     Mul7
+        move.w  d0,d2
+        move.w  cz,d0
+        move.w  cx,d1
+        bsr     Mul7
+        add.w   d0,d2
+        move.w  d2,8(a2)
+; m12 = sz*sy*cx - cz*sx
+        move.w  sz,d0
+        move.w  sy,d1
+        bsr     Mul7
+        move.w  cx,d1
+        bsr     Mul7
+        move.w  d0,d2
+        move.w  cz,d0
+        move.w  sx,d1
+        bsr     Mul7
+        sub.w   d0,d2
+        move.w  d2,10(a2)
+; m20 = -sy
+        move.w  sy,d0
+        neg.w   d0
+        move.w  d0,12(a2)
+; m21 = cy*sx
+        move.w  cy,d0
+        move.w  sx,d1
+        bsr     Mul7
+        move.w  d0,14(a2)
+; m22 = cy*cx
+        move.w  cy,d0
+        move.w  cx,d1
+        bsr     Mul7
+        move.w  d0,16(a2)
+        rts
+
+; in: a1 = vertices (x.w, y.w, z.w), d7 = count - 1, a3 = output (x.w, y.w) pairs
+; Rotates by `mat`, then projects: screen = centre + r * WIRE_D / (z + WIRE_ZOFF), using a
+; reciprocal table instead of a division. Clobbers a2 and a4.
+; a1 and a3 are left pointing after the last vertex, so objects can be chained.
+TransformVerts:
+        lea     mat,a2
+        lea     recip_wire,a4
+.tv:
+        move.w  (a1)+,d0
+        move.w  (a1)+,d1
+        move.w  (a1)+,d2
+        move.w  d0,d3
+        muls    (a2),d3
+        move.w  d1,d4
+        muls    2(a2),d4
+        add.l   d4,d3
+        move.w  d2,d4
+        muls    4(a2),d4
+        add.l   d4,d3
+        asr.l   #7,d3                      ; rotated x
+        move.w  d0,d4
+        muls    6(a2),d4
+        move.w  d1,d5
+        muls    8(a2),d5
+        add.l   d5,d4
+        move.w  d2,d5
+        muls    10(a2),d5
+        add.l   d5,d4
+        asr.l   #7,d4                      ; rotated y
+        move.w  d0,d5
+        muls    12(a2),d5
+        move.w  d1,d6
+        muls    14(a2),d6
+        add.l   d6,d5
+        move.w  d2,d6
+        muls    16(a2),d6
+        add.l   d6,d5
+        asr.l   #7,d5                      ; rotated z
+        addi.w  #WIRE_ZOFF,d5              ; distance from the eye
+        add.w   d5,d5
+        move.w  0(a4,d5.w),d5              ; WIRE_D * 256 / distance
+        muls    d5,d3
+        asr.l   #8,d3
+        addi.w  #MID_CX,d3
+        muls    d5,d4
+        asr.l   #8,d4
+        addi.w  #MID_CY,d4
+        move.w  d3,(a3)+
+        move.w  d4,(a3)+
+        dbra    d7,.tv
+        rts
+
+; Draw a line with the blitter in line mode (Hardware Reference Manual, "Line Mode").
+; in: d0 = x1, d1 = y1, d2 = x2, d3 = y2, a0 = bitplane (40 bytes per row), a6 = CUSTOM
+; The endpoints must be on the bitplane: there is no clipping. DrawWire presets the
+; registers that never change between lines (A and B data, word masks, C/D modulo).
+; Octant bits (BLTCON1 bits 4-2) come from the manual's table 6-3; dmaj/dmin are the
+; larger/smaller of |dx|, |dy|; BLTAPT = 4*dmin - 2*dmaj, BLTAMOD = 4*(dmin-dmaj),
+; BLTBMOD = 4*dmin; BLTSIZE = (dmaj+1 rows, 2 words). ONEDOT is left clear, which
+; is what makes shallow lines solid (it is only for area-fill edges).
+BlitLine:
+        move.w  d1,d6
+        lsl.w   #3,d6                      ; y*8
+        move.w  d6,d7
+        lsl.w   #2,d7                      ; y*32
+        add.w   d7,d6                      ; y*40
+        move.w  d0,d7
+        lsr.w   #3,d7
+        andi.w  #$FFFE,d7                  ; word containing the first pixel
+        add.w   d7,d6
+        lea     0(a0,d6.w),a1
+        sub.w   d0,d2                      ; dx
+        sub.w   d1,d3                      ; dy
+        moveq   #0,d4                      ; bit 0: left, bit 1: up, bit 2: steep
+        tst.w   d2
+        bpl     .dxpos
+        neg.w   d2
+        addq.w  #1,d4
+.dxpos:
+        tst.w   d3
+        bpl     .dypos
+        neg.w   d3
+        addq.w  #2,d4
+.dypos:
+        cmp.w   d2,d3
+        bls     .shallow                   ; |dy| <= |dx|: x is the long axis
+        exg     d2,d3                      ; d2 = dmaj, d3 = dmin
+        addq.w  #4,d4
+.shallow:
+        lea     octants,a2
+        move.b  0(a2,d4.w),d4              ; BLTCON1 octant bits + LINE
+        move.w  d3,d5
+        asl.w   #2,d5                      ; 4 * dmin
+        move.w  d2,d7
+        asl.w   #2,d7                      ; 4 * dmaj
+        move.w  d7,d6
+        asr.w   #1,d6                      ; 2 * dmaj
+        neg.w   d6
+        add.w   d5,d6                      ; 4*dmin - 2*dmaj
+        bpl     .nosign
+        ori.w   #$0040,d4                  ; SIGN
+.nosign:
+        move.w  d5,d1
+        sub.w   d7,d1                      ; BLTAMOD = 4*(dmin - dmaj)
+        andi.w  #15,d0
+        ror.w   #4,d0                      ; A shift = x1 & 15, in bits 15-12
+        ori.w   #$0BCA,d0                  ; use A, C, D; D = A*B + ~A*C
+        addq.w  #1,d2
+        lsl.w   #6,d2
+        addq.w  #2,d2                      ; BLTSIZE
+        ext.l   d6
+        btst    #6,DMACONR(a6)
+.bw:
+        btst    #6,DMACONR(a6)
+        bne     .bw
+        move.w  d0,BLTCON0(a6)
+        move.w  d4,BLTCON1(a6)
+        move.l  d6,BLTAPTH(a6)
+        move.w  d1,BLTAMOD(a6)
+        move.w  d5,BLTBMOD(a6)
+        move.l  a1,BLTCPTH(a6)
+        move.l  a1,BLTDPTH(a6)
+        move.w  d2,BLTSIZE(a6)
+        rts
+
         include "modplayer.s"
 
         section data,data
@@ -517,7 +932,20 @@ old_view:    dc.l 0
 gfx_base:    dc.l 0
 chip_base:   dc.l 0
 scroll_ptr:  dc.l scroll_text
-stars:       ds.w 64            ; 32 * (x, byte offset)
+rng_seed:    dc.w 1
+wire_front:  dc.w 0             ; index of the wireframe buffer being displayed
+ang_x:       dc.w 0
+ang_y:       dc.w 0
+ang_z:       dc.w 0
+sx:          dc.w 0             ; sin/cos of the current object's angles, scaled by 127
+cx:          dc.w 0
+sy:          dc.w 0
+cy:          dc.w 0
+sz:          dc.w 0
+cz:          dc.w 0
+mat:         ds.w 9             ; 3x3 rotation matrix, scaled by 128
+proj:        ds.w 14*2          ; projected (x, y) of the 14 wireframe vertices
+stars:       ds.b NSTARS*STAR_SIZE
 
 ; The eight DMA visible labels as link-time addresses. AllocChipMem rewrites
 ; every long word in place, so ptr_* slots hold runtime chip RAM addresses.
@@ -530,7 +958,7 @@ gfx_name:    dc.b "graphics.library",0
         even
 
 scroll_text:
-        dc.b "   NEON VECTORS PRESENTS: A TINY 68000 / OCS CRACKTRO - COPPER RASTERS - PAULA MOD - PLANAR GFX - GREETINGS TO EVERYONE STILL MAKING THE OLD MACHINES SING!   ",0
+        dc.b "   UBER CRACKING SERVICE PRESENTS: NEON VECTORS - A TINY 68000 OCS CRACKTRO - 3D WIREFRAME VECTORS - DEPTH STARFIELD - COPPER GRADIENTS - FOUR CHANNEL PAULA MOD - GREETINGS TO EVERYONE STILL MAKING THE OLD MACHINES SING!   ",0
         even
 
 raster_colors:
@@ -538,6 +966,95 @@ raster_colors:
         dc.w $92A,$A3B,$B4C,$C5D,$D6E,$E7F,$D6E,$C5D
         dc.w $B4C,$A3B,$92A,$819,$708,$607,$506,$405
         dc.w $304,$203,$102,$213,$324,$435,$546,$657
+
+; BLTCON1 octant bits and LINE for index (steep*4 + up*2 + left); manual table 6-3.
+octants:
+        dc.b $11,$15,$19,$1D       ; shallow: right/down, left/down, right/up, left/up
+        dc.b $01,$09,$05,$0D       ; steep:   right/down, left/down, right/up, left/up
+
+; Wireframe model. Vertices 0..7: a cube of half-size 42 (bit 0 = x, bit 1 = y,
+; bit 2 = z of the index). Vertices 8..13: an octahedron of radius 28.
+verts:
+        dc.w -42,-42,-42,  42,-42,-42, -42, 42,-42,  42, 42,-42
+        dc.w -42,-42, 42,  42,-42, 42, -42, 42, 42,  42, 42, 42
+        dc.w  28,  0,  0, -28,  0,  0,   0, 28,  0,   0,-28,  0
+        dc.w   0,  0, 28,   0,  0,-28
+edges:
+        dc.b 0,1, 2,3, 4,5, 6,7        ; cube: along x
+        dc.b 0,2, 1,3, 4,6, 5,7        ;       along y
+        dc.b 0,4, 1,5, 2,6, 3,7        ;       along z
+        dc.b 8,10, 8,11, 8,12, 8,13    ; octahedron
+        dc.b 9,10, 9,11, 9,12, 9,13
+        dc.b 10,12, 10,13, 11,12, 11,13
+edges_end:
+
+; Reciprocals that replace divisions in the inner loops (tools/gen_tables.py):
+; recip_star[z] = round(PROJ_F*256/z), recip_wire[zc] = round(WIRE_D*256/zc), so
+; screen offset = (coordinate * recip) >> 8. One MULS is cheaper than one DIVS.
+recip_star:
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 1024,993,964,936,910,886,862,840,819,799,780,762,745,728,712,697
+        dc.w 683,669,655,643,630,618,607,596,585,575,565,555,546,537,529,520
+        dc.w 512,504,496,489,482,475,468,462,455,449,443,437,431,426,420,415
+        dc.w 410,405,400,395,390,386,381,377,372,368,364,360,356,352,349,345
+        dc.w 341,338,334,331,328,324,321,318,315,312,309,306,303,301,298,295
+        dc.w 293,290,287,285,282,280,278,275,273,271,269,266,264,262,260,258
+        dc.w 256,254,252,250,248,246,245,243,241,239,237,236,234,232,231,229
+        dc.w 228,226,224,223,221,220,218,217,216,214,213,211,210,209,207,206
+        dc.w 205,204,202,201,200,199,197,196,195,194,193,192,191,189,188,187
+        dc.w 186,185,184,183,182,181,180,179,178,177,176,175,174,173,172,172
+        dc.w 171,170,169,168,167,166,165,165,164,163,162,161,161,160,159,158
+        dc.w 158,157,156,155,155,154,153,152,152,151,150,150,149,148,148,147
+        dc.w 146,146,145,144,144,143,142,142,141,141,140,139,139,138,138,137
+        dc.w 137,136,135,135,134,134,133,133,132,132,131,131,130,130,129,129
+recip_wire:
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        dc.w 0,0,0,0,0,0,375,373,371,368,366,363,361,359,356,354
+        dc.w 352,350,348,346,343,341,339,337,335,333,331,329,327,326,324,322
+        dc.w 320,318,316,315,313,311,309,308,306,304,303,301,300,298,296,295
+        dc.w 293,292,290,289,287,286,284,283,282,280,279,277,276,275,273,272
+        dc.w 271,269,268,267,266,264,263,262,261,260,258,257,256,255,254,253
+        dc.w 251,250,249,248,247,246,245,244,243,242,241,240,239,238,237,236
+        dc.w 235,234,233,232,231,230,229,228,227,226,225,224,223,223,222,221
+        dc.w 220,219,218,217,217,216,215,214,213,213,212,211,210,209,209,208
+        dc.w 207,206,206,205,204,203,203,202,201,200,200,199,198,198,197,196
+        dc.w 196,195,194,194,193,192,192,191,190,190,189,188,188,187,186,186
+        dc.w 185,185,184,183,183,182,182,181,181,180,179,179,178,178,177,177
+        dc.w 176,175,175,174,174,173,173,172,172,171,171,170,170,169,169,168
+        dc.w 168,167,167,166,166,165,165,164,164,163,163,162,162,161,161,160
+        dc.w 160,160,159,159,158,158,157,157,156,156,156,155,155,154,154,153
+        dc.w 153,153,152,152,151,151,151,150,150,149,149,149,148,148,147,147
+        dc.w 147,146,146,146,145,145,144,144,144,143,143,143,142,142,142,141
+        dc.w 141,140,140,140,139,139,139,138,138,138,137,137,137,136,136,136
+
+; 256 entries, one turn, amplitude 127 (tools/gen_tables.py sintab).
+sintab:
+        dc.w 0,3,6,9,12,16,19,22,25,28,31,34,37,40,43,46
+        dc.w 49,51,54,57,60,63,65,68,71,73,76,78,81,83,85,88
+        dc.w 90,92,94,96,98,100,102,104,106,107,109,111,112,113,115,116
+        dc.w 117,118,120,121,122,122,123,124,125,125,126,126,126,127,127,127
+        dc.w 127,127,127,127,126,126,126,125,125,124,123,122,122,121,120,118
+        dc.w 117,116,115,113,112,111,109,107,106,104,102,100,98,96,94,92
+        dc.w 90,88,85,83,81,78,76,73,71,68,65,63,60,57,54,51
+        dc.w 49,46,43,40,37,34,31,28,25,22,19,16,12,9,6,3
+        dc.w 0,-3,-6,-9,-12,-16,-19,-22,-25,-28,-31,-34,-37,-40,-43,-46
+        dc.w -49,-51,-54,-57,-60,-63,-65,-68,-71,-73,-76,-78,-81,-83,-85,-88
+        dc.w -90,-92,-94,-96,-98,-100,-102,-104,-106,-107,-109,-111,-112,-113,-115,-116
+        dc.w -117,-118,-120,-121,-122,-122,-123,-124,-125,-125,-126,-126,-126,-127,-127,-127
+        dc.w -127,-127,-127,-127,-126,-126,-126,-125,-125,-124,-123,-122,-122,-121,-120,-118
+        dc.w -117,-116,-115,-113,-112,-111,-109,-107,-106,-104,-102,-100,-98,-96,-94,-92
+        dc.w -90,-88,-85,-83,-81,-78,-76,-73,-71,-68,-65,-63,-60,-57,-54,-51
+        dc.w -49,-46,-43,-40,-37,-34,-31,-28,-25,-22,-19,-16,-12,-9,-6,-3
+        even
 
 ; ---------------------------------------------------------------------------
 ; All DMA visible payloads. The block is copied into freshly allocated chip
@@ -562,20 +1079,89 @@ cop_bpl1:
         dc.w BPL1PTH,0,BPL1PTL,0
         dc.w BPL2PTH,0,BPL2PTL,0
         dc.w BPL3PTH,0,BPL3PTL,0
-        dc.w COLOR00,$001,$0182,$FFF,$0184,$5DF,$0186,$27A
-        dc.w $0188,$8BF,$018A,$248,$018C,$48C,$018E,$8CF
-        dc.w $8001,$FFFE
+        dc.w COLOR00,$001,COLOR01,$FFF,COLOR02,$3FC,COLOR03,$3FC
+        dc.w COLOR04,$779,COLOR05,$FFF,COLOR06,$3FC,COLOR07,$3FC
+; Colour gradients per raster line (tools/gen_tables.py copper). COLOR01 is
+; the text colour in the logo and scroller bands and the mid-distance star colour
+; in the middle band; COLOR02/03/06/07 are the wireframe colour (plane 1), so the
+; wireframe stays in front of any star drawn behind it.
+        dc.w $3401,$FFFE,COLOR00,$0002,COLOR01,$0FFF
+        dc.w $3601,$FFFE,COLOR00,$0002,COLOR01,$0FFE
+        dc.w $3801,$FFFE,COLOR00,$0002,COLOR01,$0FFE
+        dc.w $3A01,$FFFE,COLOR00,$0002,COLOR01,$0FFD
+        dc.w $3C01,$FFFE,COLOR00,$0002,COLOR01,$0FFD
+        dc.w $3E01,$FFFE,COLOR00,$0002,COLOR01,$0FFC
+        dc.w $4001,$FFFE,COLOR00,$0002,COLOR01,$0FFC
+        dc.w $4201,$FFFE,COLOR00,$0002,COLOR01,$0FFB
+        dc.w $4401,$FFFE,COLOR00,$0103,COLOR01,$0FFB
+        dc.w $4601,$FFFE,COLOR00,$0103,COLOR01,$0FFA
+        dc.w $4801,$FFFE,COLOR00,$0103,COLOR01,$0FF9
+        dc.w $4A01,$FFFE,COLOR00,$0103,COLOR01,$0FF9
+        dc.w $4C01,$FFFE,COLOR00,$0103,COLOR01,$0FE8
+        dc.w $4E01,$FFFE,COLOR00,$0103,COLOR01,$0FE8
+        dc.w $5001,$FFFE,COLOR00,$0103,COLOR01,$0FD7
+        dc.w $5201,$FFFE,COLOR00,$0103,COLOR01,$0FD6
+        dc.w $5401,$FFFE,COLOR00,$0113,COLOR01,$0FC6
+        dc.w $5601,$FFFE,COLOR00,$0113,COLOR01,$0FC5
+        dc.w $5801,$FFFE,COLOR00,$0113,COLOR01,$0FB4
+        dc.w $5A01,$FFFE,COLOR00,$0113,COLOR01,$0FB4
+        dc.w $5C01,$FFFE,COLOR00,$0113,COLOR01,$0FA4
+        dc.w $5E01,$FFFE,COLOR00,$0113,COLOR01,$0FA4
+        dc.w $6001,$FFFE,COLOR00,$0113,COLOR01,$0F93
+        dc.w $6201,$FFFE,COLOR00,$0113,COLOR01,$0F93
+        dc.w $6401,$FFFE,COLOR00,$0214,COLOR01,$0F83
+        dc.w $6601,$FFFE,COLOR00,$0214,COLOR01,$0E83
+        dc.w $6801,$FFFE,COLOR00,$0214,COLOR01,$0E73
+        dc.w $6A01,$FFFE,COLOR00,$0214,COLOR01,$0E73
+        dc.w $6C01,$FFFE,COLOR00,$0214,COLOR01,$0E62
+        dc.w $6E01,$FFFE,COLOR00,$0214,COLOR01,$0E62
+        dc.w $7001,$FFFE,COLOR00,$0214,COLOR01,$0E52
+        dc.w $7201,$FFFE,COLOR00,$0214,COLOR01,$0E52
+        dc.w $7401,$FFFE                    ; y=72: animated slot
 cop_raster_color:
-        dc.w COLOR00,$013            ; animated by UpdateRaster each frame
-        dc.w $8801,$FFFE,COLOR00,$024
-        dc.w $9001,$FFFE,COLOR00,$035
-        dc.w $9801,$FFFE,COLOR00,$046
-        dc.w $A001,$FFFE,COLOR00,$057
-        dc.w $A801,$FFFE,COLOR00,$001
+        dc.w COLOR00,$013                   ; animated by UpdateRaster each frame
+        dc.w $7801,$FFFE,COLOR00,$0001,COLOR01,$0AAD
+        dc.w $8001,$FFFE,COLOR00,$0001
+        dc.w $8801,$FFFE,COLOR00,$0012
+        dc.w $9001,$FFFE,COLOR00,$0012
+        dc.w $9801,$FFFE,COLOR00,$0013
+        dc.w $A001,$FFFE,COLOR00,$0013
+        dc.w $A801,$FFFE,COLOR00,$0024
+        dc.w $B001,$FFFE,COLOR00,$0024
+        dc.w $B801,$FFFE,COLOR00,$0024
+        dc.w $C001,$FFFE,COLOR00,$0013
+        dc.w $C801,$FFFE,COLOR00,$0013
+        dc.w $D001,$FFFE,COLOR00,$0012
+        dc.w $D801,$FFFE,COLOR00,$0012
+        dc.w $E001,$FFFE,COLOR00,$0001
+        dc.w $E801,$FFFE,COLOR00,$0001
+        dc.w $F001,$FFFE,COLOR00,$0001
+        dc.w $F101,$FFFE,COLOR00,$06CF
+        dc.w $F201,$FFFE,COLOR00,$0124
+        dc.w $F401,$FFFE,COLOR01,$07EF
+        dc.w $F601,$FFFE,COLOR01,$09EF
+        dc.w $F801,$FFFE,COLOR01,$0CFF
+        dc.w $FA01,$FFFE,COLOR01,$0EFF
+        dc.w $FC01,$FFFE,COLOR01,$0EEF
+        dc.w $FE01,$FFFE,COLOR01,$0BDF
+        dc.w $FFDF,$FFFE                    ; wrap: lines below are 256 + WAIT line
+        dc.w $0001,$FFFE,COLOR01,$08CE
+        dc.w $0201,$FFFE,COLOR01,$05BE
+        dc.w $0601,$FFFE,COLOR00,$06CF
+        dc.w $0701,$FFFE,COLOR00,$0001
+        dc.w $0A01,$FFFE,COLOR00,$0102
+        dc.w $0E01,$FFFE,COLOR00,$0001
+        dc.w $1201,$FFFE,COLOR00,$0214
+        dc.w $1601,$FFFE,COLOR00,$0001
+        dc.w $1A01,$FFFE,COLOR00,$0426
+        dc.w $1E01,$FFFE,COLOR00,$0001
+        dc.w $2201,$FFFE,COLOR00,$0528
+        dc.w $2601,$FFFE,COLOR00,$0001
+        dc.w $2A01,$FFFE,COLOR00,$063A
         dc.w $FFFF,$FFFE
 
         cnop 0,4
-screen:     ds.b PLANE_SIZE*3
+screen:     ds.b PLANE_SIZE*4   ; plane 0 | wireframe buffer 0 | wireframe buffer 1 | plane 2
 logo_data:  incbin "assets/logo.raw"
 font_data:  incbin "assets/font.raw"
         even

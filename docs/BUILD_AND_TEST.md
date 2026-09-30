@@ -6,10 +6,11 @@
 | --- | --- | --- |
 | Asset semantics + 68000 source rules | `make validate` | passes |
 | Asset determinism | `make verify-repro` | passes |
-| Validator self-test | `make mutants` | 32/32 injected faults caught |
+| Validator self-test | `make mutants` | 33/33 injected faults caught |
 | 68000 assembly | `make` | assembles with VASM 2.0f, no errors |
 | Hunk executable structure | `make` (`hunkcheck.py`) | valid; 3 hunks (code, data, chip data) |
 | Behaviour on an emulated 68000 | `make emutest` | passes (PAL, `--loader-chip`, `--alloc-fast`, `--ntsc`) |
+| Emulation-test self-test | `make emu-mutants` | 14/14 injected faults caught |
 | Cycle-exact emulator | FS-UAE, A500 config, AROS ROM | runs, animates, exits cleanly; audio not audited by ear |
 | Genuine Kickstart ROM | FS-UAE / WinUAE / Amiberry | **not run** |
 | Real PAL OCS/ECS machine | — | **not run** |
@@ -20,6 +21,7 @@
 make            # assets -> validate -> assemble -> hunk check
 make mutants
 make emutest    # needs: pip install machine68k
+make emu-mutants  # slow: one emulated run per injected fault
 make release    # clean, build, reproducibility, manifest
 ```
 
@@ -43,10 +45,11 @@ Use an A500-class PAL configuration: 68000, OCS or ECS, 512 KiB+ chip RAM, **cyc
 chipset emulation. Start from a Shell and run `neon_vectors`, then confirm:
 
 - [ ] logo is stable and unclipped; raster band animates without Copper corruption
-- [ ] stars drift to the right, wrap at the right edge, leave no trails
+- [ ] the starfield flies outward from the centre in three brightnesses; no trails or flicker; wireframe stays in front of the stars
 - [ ] scroller moves left smoothly and inserts clean columns; text wraps at the end
 - [ ] all four channels audible; drums retrigger; no persistent buzz after a one-shot; no noise burst at start
-- [ ] no visible tearing or flicker at the bottom of the logo/scroller (per-frame work ≈ 17–22 k cycles vs ≈ 25 k window)
+- [ ] the wireframe cube and octahedron rotate smoothly with no half-drawn frames; all edges solid
+- [ ] no visible tearing in the starfield or scroller (per-frame work ≈ 71 k cycles average, 80 k worst, of ≈ 142 k)
 - [ ] left mouse button exits; the previous display returns; the system keeps running
 - [ ] run it repeatedly: memory is returned each time (check `avail`)
 

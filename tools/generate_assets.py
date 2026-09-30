@@ -98,15 +98,18 @@ def draw_text(text,x,y,scale=4,advance=6):
                         for xx in range(scale): pset(x+gx*scale+xx,y+gy*scale+yy)
         x += advance*scale
 
-# The 5 pixel wide glyph ink plus one blank column must fit inside the 320
-# pixel display window, otherwise the logo is clipped on both sides.
-logo='NEON VECTORS'; scale=4
-ink_width=(len(logo)-1)*6*scale+5*scale
-check_width=(W-ink_width)//2
-draw_text(logo,check_width,10,scale)
-for yy in (51,52): line(20,yy,299,yy)
-for x in (12,307):
-    line(x,8,x,55); line(x-5,13,x+5,13); line(x-5,50,x+5,50)
+# Two lines: the group name large, the rest of it smaller. A glyph's ink covers
+# columns 1..5 of its 8 pixel cell and each character advances 6 cells, so the
+# ink of n characters is (n-1)*6*scale + 5*scale wide and starts `scale` pixels
+# into the first cell; the text is centred on that ink.
+def centred(text,y,scale):
+    ink=(len(text)-1)*6*scale+5*scale
+    draw_text(text,(W-ink)//2-scale,y,scale)
+centred('UBER',6,5)
+centred('CRACKING SERVICE',46,2)
+for yy in (2,61): line(24,yy,295,yy)
+for x in (14,305):
+    line(x,4,x,59); line(x-4,4,x+4,4); line(x-4,59,x+4,59)
 raw=bytearray()
 for y in range(H):
     for xb in range(0,W,8):

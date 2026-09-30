@@ -43,6 +43,10 @@ verify-repro:
 emutest:
 	$(PYTHON) tools/emu_test.py
 
+# Self-test of the emulation test: inject faults, require each to fail it (slow).
+emu-mutants:
+	$(PYTHON) tools/mutate_emu.py
+
 manifest:
 	$(PYTHON) tools/make_manifest.py
 
@@ -73,4 +77,4 @@ distclean: clean
 
 release: clean all verify-repro manifest
 
-.PHONY: all assets validate mutants verify-repro emutest manifest toolchain hunkcheck clean distclean release
+.PHONY: all assets validate mutants verify-repro emutest emu-mutants manifest toolchain hunkcheck clean distclean release

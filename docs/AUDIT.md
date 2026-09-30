@@ -88,6 +88,15 @@ other Exec/graphics LVOs; `Forbid` → `Disable` and `Enable` → `Permit` order
 layout and the replay core's row/period/sample decoding; the asset generator's unsigned 8-bit
 sample centring; the reproducibility of the generated assets.
 
+## Addendum: graphics revision
+
+The wireframe, starfield and gradient work (see `RELEASE_NOTES.md`) was built and verified with the
+methods above. Its development-time findings were: `CalcMatrix` clobbered the caller's vertex pointer
+(seen immediately in FS-UAE as a missing octahedron and stray marks); the blitter `ONEDOT` bit has
+to be left clear for ordinary lines; the first CPU cost (about 96 000 cycles per frame) was too close
+to the frame budget and was reduced to about 71 000; and the emulation harness double-counted the
+frame-sync spin loop. All are fixed or explained, and each has a matching fault in `make emu-mutants`.
+
 ## Verified in FS-UAE
 
 The final build was run in FS-UAE 3 (WinUAE core, cycle-exact) configured as an A500 (68000, OCS,

@@ -7,9 +7,10 @@ mutation self-test keep known mistakes from coming back.
 | Layer | Command | Checks |
 | --- | --- | --- |
 | Static | `make validate` | assets and source rules below; gates the build |
-| Self-test | `make mutants` | validator must detect all 32 injected faults |
+| Self-test | `make mutants` | validator must detect all 33 injected faults |
 | Assembler | `make` | VASM assembles; `hunkcheck.py` parses the executable |
 | Behaviour | `make emutest` | real binary on an emulated 68000 |
+| Behaviour self-test | `make emu-mutants` | the emulation test must fail for all 14 injected faults (slow) |
 
 ## `tools/validate.py` — assets
 
@@ -48,7 +49,7 @@ Rules that used to exist and were **removed** because they were wrong: "memory-t
 
 ## `tools/mutate.py`
 
-Copies the tree, injects 32 faults one at a time (swapped scheduler calls, patching a register
+Copies the tree, injects 33 faults one at a time (swapped scheduler calls, patching a register
 word, a wrong silence value, typos in symbols and labels, broken Copper terminator/WAIT, duplicated
 labels, direct chip-label use, short branches, symbolic and numeric oversize index
 displacements, PC-relative destination and read, `addi` to `aN`, oversize shift count, a write to
@@ -58,15 +59,29 @@ requires the validator to report each. It exits non-zero if any fault is missed.
 
 ## `tools/emu_test.py`
 
-See the README. The harness stubs Exec and graphics.library with the real register conventions,
-trashes scratch registers on return, models SET/CLR registers, the beam counter, a Copper
-interpreter and Paula start latching. It asserts memory balance (with guard bytes around the
-allocation), register and stack preservation, restored chipset state, exactly one loop
-iteration per frame, every audio trigger and reload against the module, and a pixel-exact frame.
-It was itself checked by re-injecting earlier bugs.
+See the README. The harness stubs Exec and graphics.library with the real register conventions
+(including `a6` = library base), trashes scratch registers on return, models SET/CLR registers, the
+beam counter, a Copper interpreter (with the `$FFDF` wrap) and Paula start latching, and — for the
+graphics — a **blitter model**: line mode following the Hardware Reference Manual's register-level
+algorithm, and the D-only rectangle clear. Any other blit is reported rather than guessed at.
 
-What it cannot prove: DMA cycle stealing, real beam timing, blitter behaviour and anything about
-how the picture or sound *looks* or *sounds* on a real Amiga.
+It asserts memory balance (with guard bytes around the allocation), register and stack
+preservation, restored chipset state, exactly one loop iteration per frame, the CPU budget, the
+single-buffered deadlines (stars before the beam reaches the starfield, scroller before its strip),
+alternating wireframe buffers, every audio trigger and reload against the module, and pixel-exact
+planes against independent Python reference models: the logo, every star position and depth class,
+every scroller pixel, and the wireframe (reference matrix, perspective and Bresenham) — the last on
+**every frame**, including the rows outside the band.
+
+The harness was itself mutation-tested (`make emu-mutants`): swapped octant table entries,
+`ONEDOT` set, no double buffering, a short band clear, a wrong rotation-matrix sign, missing star
+erase, a scroller overrun, blitter DMA never enabled, a missing Copper wrap, `AUDxLEN` off by one,
+swapped `CopyMem` arguments, missing frame-sync edge detection, leaked memory and a masked
+vertical-blank interrupt before `WaitTOF`.
+
+What it cannot prove: DMA cycle stealing, real beam timing, blitter *timing*, and anything about
+how the picture or sound *looks* or *sounds* on a real Amiga. The blitter's line mode was checked
+against real emulated hardware by running the program in FS-UAE.
 
 ## Reproducibility
 

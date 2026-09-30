@@ -32,6 +32,22 @@ DMACON      EQU $096
 INTENA      EQU $09A
 INTREQ      EQU $09C
 ADKCON      EQU $09E
+; Blitter (line mode and D-only clear are used). BLTSIZE starts the blit and is written last.
+BLTCON0     EQU $040
+BLTCON1     EQU $042
+BLTAFWM     EQU $044
+BLTALWM     EQU $046
+BLTCPTH     EQU $048
+BLTBPTH     EQU $04C
+BLTAPTH     EQU $050
+BLTDPTH     EQU $054
+BLTSIZE     EQU $058
+BLTCMOD     EQU $060
+BLTBMOD     EQU $062
+BLTAMOD     EQU $064
+BLTDMOD     EQU $066
+BLTBDAT     EQU $072
+BLTADAT     EQU $074
 AUD0LCH     EQU $0A0
 AUD0LEN     EQU $0A4       ; the four Paula channels are 16 bytes apart
 AUD0PER     EQU $0A6
@@ -51,6 +67,13 @@ BPLCON2     EQU $104
 BPL1MOD     EQU $108
 BPL2MOD     EQU $10A
 COLOR00     EQU $180
+COLOR01     EQU $182
+COLOR02     EQU $184
+COLOR03     EQU $186
+COLOR04     EQU $188
+COLOR05     EQU $18A
+COLOR06     EQU $18C
+COLOR07     EQU $18E
 CIAAPRA     EQU $BFE001
 
 ; DMACONR/DMACON enable bits (hardware/dmabits.h): audio 0-3, disk 4,

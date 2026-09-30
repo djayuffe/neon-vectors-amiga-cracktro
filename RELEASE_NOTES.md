@@ -1,5 +1,33 @@
 # Release notes
 
+## Graphics revision — UBER CRACKING SERVICE
+
+- **Branding:** the logo is now `UBER` over `CRACKING SERVICE`, and the scroller opens with
+  "UBER CRACKING SERVICE PRESENTS: NEON VECTORS".
+- **3D starfield:** 64 perspective-projected stars flying out of the screen, in three depth
+  brightnesses built from the free bitplane combinations; a reciprocal table replaces the divisions.
+- **3D wireframe:** a cube and a counter-rotating octahedron (24 edges), rotated with 7-bit matrices,
+  perspective-projected, and drawn with the **blitter in line mode** into a **double-buffered**
+  bitplane (the Copper's plane 1 pointer flips every frame), so a half-drawn frame is never shown.
+- **Proper graphics:** Copper gradients through the logo, the background, the middle band and the
+  scroller strip; a floor of colour bars (the Copper wraps below line 255); the scroller strip is
+  framed. `COLOR01` changes per band, so one bitplane serves as logo text, star and scroller.
+- **Tests:** `emu_test.py` gained a blitter model (line mode and rectangle clear), Copper wrap
+  handling, exact reference models for the starfield and wireframe math, a CPU-budget check, the
+  single-buffer deadline checks, and a per-frame check of the displayed wireframe buffer.
+  `make emu-mutants` (new) injects 14 faults into the program and requires the emulation test to fail
+  each time. `make mutants` stays 33/33.
+- **Found while building it:** the blitter's `ONEDOT` bit must be left clear for ordinary lines
+  (set, shallow lines come out with gaps); the rotation routine first clobbered the caller's vertex
+  pointer (visible at once in FS-UAE as a missing octahedron); the first version of the starfield
+  and wireframe needed about 96 000 cycles per frame — reciprocal tables, once-per-frame blitter
+  constants and cheaper address arithmetic brought that to about 71 000; and the test harness itself
+  counted the spin of the frame-sync loop as extra frames.
+
+Status: host checks, both mutation self-tests and the emulated-CPU test pass, and the program runs
+and exits cleanly in FS-UAE (A500, AROS ROM) with all the new graphics visible. Not yet verified
+with a genuine Kickstart ROM or on real hardware.
+
 ## Audit revision
 
 Full audit of the code, tooling and documentation; see [`docs/AUDIT.md`](docs/AUDIT.md) for the

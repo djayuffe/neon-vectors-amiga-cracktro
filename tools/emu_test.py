@@ -54,6 +54,22 @@ def check(cond, msg):
 
 
 # --- assemble a copy with symbols ---------------------------------------------
+def source_equs():
+    """Numeric EQUs of src/main.s and src/hardware.i (the layout constants the test relies on)."""
+    import re
+    vals = {}
+    for f in ('src/hardware.i', 'src/main.s'):
+        for line in (ROOT / f).read_text().splitlines():
+            m = re.match(r'([A-Za-z_]\w*)\s+(?:EQU|equ)\s+([^;]+)', line)
+            if m:
+                expr = m.group(2).strip()
+                try:
+                    vals[m.group(1)] = int(eval(re.sub(r'\$([0-9A-Fa-f]+)', r'0x\1', expr), {}, dict(vals)))
+                except Exception:
+                    pass
+    return vals
+
+
 def find_vasm():
     for c in (os.environ.get('VASM'), shutil.which('vasmm68k_mot'), str(ROOT / 'tools/bin/vasmm68k_mot')):
         if c and Path(c).exists():
@@ -138,6 +154,10 @@ class Amiga:
         self.pending_loopcheck = []
         self.loopregs = []           # (t, ch, ptr, len) sampled after a row
         self.chip_block = None
+        self.blit_lines = self.blit_clears = 0
+        self.frame_hook = None
+        self.bpl2_seen = []          # BPL2PT (wireframe buffer) in the Copper list, per frame
+        self.t_marks = {}            # symbol -> [(time)]
         self.mouse_down_at = None
         self.load(exe, loader_chip)
 
@@ -312,7 +332,69 @@ class Amiga:
     def setclr(state, v):
         return (state | (v & 0x7FFF)) if v & 0x8000 else (state & ~v & 0x7FFF)
 
+    def blit(self):
+        """Execute the blit that a write to BLTSIZE just started (instantly; BBUSY is never seen set).
+
+        Only the two modes this program uses exist: line mode (BLTCON1 bit 0) following the
+        Hardware Reference Manual's register-level algorithm, and a D-only clear. Anything
+        else is reported instead of being guessed at."""
+        m = self.mem
+        if (self.dmacon & 0x240) != 0x240:
+            failures.append('blit started with master/blitter DMA off (DMACON=$%04X)' % self.dmacon); return
+        s16 = lambda v: v - 0x10000 if v & 0x8000 else v
+        con0, con1, size = m.r16(CUSTOM + 0x40), m.r16(CUSTOM + 0x42), m.r16(CUSTOM + 0x58)
+        h, w = (size >> 6) or 1024, (size & 63) or 64
+        if con1 & 1:                                                     # ---- line mode
+            self.blit_lines += 1
+            if w != 2 or (con0 & 0x0F00) != 0x0B00 or (con0 & 0xFF) != 0xCA or (con1 & 2):
+                failures.append('unsupported line-mode setup BLTCON0=$%04X BLTCON1=$%04X BLTSIZE=$%04X' % (con0, con1, size)); return
+            ash = con0 >> 12
+            acc = s16(m.r32(CUSTOM + 0x50) & 0xFFFF)
+            amod, bmod = s16(m.r16(CUSTOM + 0x64)), s16(m.r16(CUSTOM + 0x62))
+            cptr, dptr = m.r32(CUSTOM + 0x48), m.r32(CUSTOM + 0x54)
+            cmod, dmod = s16(m.r16(CUSTOM + 0x60)), s16(m.r16(CUSTOM + 0x66))
+            check(cptr == dptr and cmod == dmod, 'line mode: C and D must address the same bitmap')
+            check(m.r16(CUSTOM + 0x74) == 0x8000 and m.r16(CUSTOM + 0x72) == 0xFFFF and
+                  m.r16(CUSTOM + 0x44) == 0xFFFF and m.r16(CUSTOM + 0x46) == 0xFFFF, 'line mode: A data/B data/word masks not preloaded')
+            sud, sul, aul = (con1 >> 4) & 1, (con1 >> 3) & 1, (con1 >> 2) & 1
+            sign = bool(con1 & 0x40)
+            check(sign == (acc < 0), 'line mode: SIGN bit does not match the sign of BLTAPT')
+            maj = -1 if aul else 1
+            mnr = -1 if sul else 1
+            ptr = dptr
+            pix = []
+            def step_x(d):
+                nonlocal ash, ptr
+                ash += d
+                if ash == 16: ash = 0; ptr += 2
+                if ash < 0: ash = 15; ptr -= 2
+            for _ in range(h):
+                word = m.r16(ptr) | (0x8000 >> ash)
+                m.w16(ptr, word)
+                if sign:
+                    acc += bmod
+                    (step_x(maj) if sud else None)
+                    if not sud: ptr += maj * dmod
+                else:
+                    acc += amod
+                    if sud:
+                        step_x(maj); ptr += mnr * dmod
+                    else:
+                        ptr += maj * dmod; step_x(mnr)
+                sign = acc < 0
+        else:                                                            # ---- rectangle, D only
+            self.blit_clears += 1
+            if con0 != 0x0100:
+                failures.append('unsupported blit BLTCON0=$%04X (only the D-only clear is modelled)' % con0); return
+            dptr, dmod = m.r32(CUSTOM + 0x54), s16(m.r16(CUSTOM + 0x66))
+            for _ in range(h):
+                m.w_block(dptr, bytes(w * 2))
+                dptr += w * 2 + dmod
+
     def poll_custom(self):
+        if self.mem.r16(CUSTOM + 0x58):
+            self.blit()
+            self.mem.w16(CUSTOM + 0x58, 0)          # so an identical BLTSIZE write is seen again
         raw = self.mem.r_block(CUSTOM + 0x96, 10)
         if raw == self.raw:
             return
@@ -370,7 +452,9 @@ class Amiga:
         self.sentinel_regs = sentinel_regs
         wfs = self.sym('WaitFrameSync')
         self.exit_pc = None
+        self.in_wfs = False
         self.exit_times = []
+        self.mark_pcs = {self.sym('UpdateScroller'): 'scroller', self.sym('DrawWire'): 'wire'}
         self.snapshot = None
         steps = 0
         while True:
@@ -389,10 +473,21 @@ class Amiga:
                 if lo <= pc < hi:
                     failures.append('jump into an unimplemented library vector at $%X' % pc); return False
             if pc == self.exit_pc:
-                self.exit_times.append(self.t); self.exit_pc = None
-            if pc == wfs:
+                self.exit_times.append(self.t); self.exit_pc = None; self.in_wfs = False
+            tm = self.mark_pcs.get(pc)
+            if tm:
+                self.t_marks.setdefault(tm, []).append(self.t)
+            if pc == wfs and not self.in_wfs:
+                self.in_wfs = True                  # one entry per call, not per pass of its spin loop
                 self.exit_pc = mem.r32(cpu.r_reg(R.A7))
                 self.frame_marks.append(self.t)
+                cl = mem.r32(CUSTOM + 0x80)
+                if cl:
+                    # BPL2PT words sit at offsets 10/14 from cop_bpl1, which is the label after the header
+                    cb = cl + self.sym('cop_bpl1') - self.sym('copper')
+                    self.bpl2_seen.append((mem.r16(cb + 10) << 16) | mem.r16(cb + 14))
+                    if self.frame_hook:
+                        self.frame_hook(len(self.frame_marks), self.bpl2_seen[-1])
                 self.sample_loop_regs()
                 n = len(self.frame_marks)
                 if n == snap_frame and FRAME_LINES == 312:
@@ -415,13 +510,16 @@ class Amiga:
         out = dict(dmacon=self.dmacon, intena=self.intena)
         out['shifts'] = (mem.r32(self.sym('scroll_ptr')) - self.sym('scroll_text')) * 8 + mem.r8(self.sym('glyph_col'))
         a = mem.r32(CUSTOM + 0x80)
-        ev, line, terminated = [], 0, False
+        ev, line, terminated, wrapped = [], 0, False, False
         for _ in range(4096):
             w1, w2 = mem.r16(a), mem.r16(a + 2); a += 4
             if w1 & 1:
                 if (w1, w2) == (0xFFFF, 0xFFFE):
                     terminated = True; break
-                line = max(line, w1 >> 8)
+                if (w1, w2) == (0xFFDF, 0xFFFE):
+                    wrapped = True; line = max(line, 255)       # vertical counter wraps: later WAITs are 256 + n
+                else:
+                    line = max(line, (256 if wrapped else 0) + (w1 >> 8))
             else:
                 ev.append((line, w1, w2))
         out['terminated'] = terminated
@@ -464,6 +562,8 @@ class Amiga:
             pal_l = pal_by_line[y]
             img.append([pal_l[v] for v in rowpix])
         out['px'] = planes_px
+        out['planes'] = [mem.r_block(ptr[p], 10240) for p in range(3)]
+        out['pal_by_line'] = pal_by_line
         out['img'] = img
         out['pal128'] = pal_by_line[0x80][0]
         return out
@@ -477,6 +577,105 @@ class Amiga:
 
 
 # --- checks ---------------------------------------------------------------------
+
+# --- reference models ---------------------------------------------------------------
+# Independent Python versions of what the program computes, written from the design, not
+# transcribed from the assembly: the 16 bit LCG, the star projection, the 7 bit rotation
+# matrix and perspective, and an ordinary integer Bresenham line. Integer semantics match
+# the 68000 (MULS/DIVS truncate toward zero, ASR floors).
+def trunc_div(a, b):
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b > 0) else -q
+
+
+def ref_stars(nupdates, nstars, consts):
+    ZMIN, ZRANGE, ZSPEED, ZMID, ZNEAR, PROJ_F, CX, CY, Y0, H = consts
+    recip = lambda z: int(round(PROJ_F * 256 / z))
+    seed = 1
+    def rand():
+        nonlocal seed
+        seed = (seed * 25173 + 13849) & 0xFFFF
+        return seed
+    st = []
+    for _ in range(nstars):
+        x = (rand() & 511) - 255
+        y = ((((rand() & 255) - 128) * 5) >> 3)
+        z = (((rand() & 255) * ZRANGE) >> 8) + ZMIN
+        st.append([x, y, z])
+    for _ in range(nupdates):
+        for q in st:
+            q[2] -= ZSPEED
+            if q[2] < ZMIN:
+                q[2] += ZRANGE
+                q[0] = (rand() & 511) - 255
+                q[1] = ((((rand() & 255) - 128) * 5) >> 3)
+    out = []                                    # (x, y, class) of every star that is on screen
+    for x, y, z in st:
+        sx = (((x * recip(z)) >> 8) + CX) & 0xFFFF
+        sy = (((y * recip(z)) >> 8) + CY) & 0xFFFF
+        if sx >= 320 or ((sy - Y0) & 0xFFFF) >= H:
+            continue
+        out.append((sx, sy, 3 if z <= ZNEAR else 2 if z <= ZMID else 1))
+    return out
+
+
+def ref_bresenham(x1, y1, x2, y2):
+    dx, dy = abs(x2 - x1), abs(y2 - y1)
+    sx, sy = (1 if x2 > x1 else -1), (1 if y2 > y1 else -1)
+    pts = []
+    if dx >= dy:
+        d, x, y = 2 * dy - dx, x1, y1
+        for _ in range(dx + 1):
+            pts.append((x, y))
+            if d >= 0:
+                y += sy; d += 2 * (dy - dx)
+            else:
+                d += 2 * dy
+            x += sx
+    else:
+        d, x, y = 2 * dx - dy, x1, y1
+        for _ in range(dy + 1):
+            pts.append((x, y))
+            if d >= 0:
+                x += sx; d += 2 * (dx - dy)
+            else:
+                d += 2 * dx
+            y += sy
+    return pts
+
+
+def ref_wire(k, verts, edges, consts):
+    import math
+    D, ZOFF, CX, CY = consts
+    tab = [int(round(127 * math.sin(2 * math.pi * i / 256))) for i in range(256)]
+    sin = lambda a: tab[a & 255]
+    cos = lambda a: tab[(a + 64) & 255]
+    m7 = lambda a, b: (a * b) >> 7
+    def matrix(ax, ay, az):
+        sx, cx, sy, cy, sz, cz = sin(ax), cos(ax), sin(ay), cos(ay), sin(az), cos(az)
+        return [m7(cz, cy),
+                m7(m7(cz, sy), sx) - m7(sz, cx),
+                m7(m7(cz, sy), cx) + m7(sz, sx),
+                m7(sz, cy),
+                m7(m7(sz, sy), sx) + m7(cz, cx),
+                m7(m7(sz, sy), cx) - m7(cz, sx),
+                -sy, m7(cy, sx), m7(cy, cx)]
+    def project(m, v):
+        x, y, z = v
+        xr = (m[0] * x + m[1] * y + m[2] * z) >> 7
+        yr = (m[3] * x + m[4] * y + m[5] * z) >> 7
+        zc = ((m[6] * x + m[7] * y + m[8] * z) >> 7) + ZOFF
+        r = int(round(D * 256 / zc))
+        return (((xr * r) >> 8) + CX, ((yr * r) >> 8) + CY)
+    ma = matrix(k, 2 * k, k)
+    mb = matrix(2 * k, -k, -2 * k)
+    proj = [project(ma, v) for v in verts[:8]] + [project(mb, v) for v in verts[8:]]
+    pix = set()
+    for i, j in edges:
+        pix.update(ref_bresenham(proj[i][0], proj[i][1], proj[j][0], proj[j][1]))
+    return pix, proj
+
+
 def png(path, w, h, rows):
     raw = b''.join(b'\0' + bytes(r) for r in rows)
     def chunk(t, d):
@@ -506,7 +705,34 @@ def main():
     font = (ROOT / 'assets/font.raw').read_bytes()
 
     a = Amiga(exe, args.loader_chip, args.alloc_fast)
+    a.consts = source_equs()
     snap_frame = min(args.snap, args.frames - 1)
+    # Every frame, the wireframe buffer the Copper is showing must equal the reference frame
+    # exactly, including the rows outside the band. A single snapshot can miss stale pixels
+    # that only occur in rows the object seldom reaches.
+    wire_fail = []
+    wire_frames = [0]
+    def wire_each_frame(n, bpl2):
+        if n < 3 or wire_fail:
+            return
+        eq = a.consts
+        if not a.ready_verts:
+            a.ready_verts = True
+            a.wv = [struct.unpack('>3h', a.mem.r_block(a.sym('verts') + 6 * i, 6)) for i in range(14)]
+            eb = a.mem.r_block(a.sym('edges'), a.sym('edges_end') - a.sym('edges'))
+            a.we = [(eb[i], eb[i + 1]) for i in range(0, len(eb), 2)]
+        pix, _ = ref_wire(n - 2, a.wv, a.we, (eq['WIRE_D'], eq['WIRE_ZOFF'], eq['MID_CX'], eq['MID_CY']))
+        want = bytearray(10240)
+        for x, y in pix:
+            if 0 <= x < 320 and 0 <= y < 256:
+                want[y * 40 + (x >> 3)] |= 0x80 >> (x & 7)
+        got = a.mem.r_block(bpl2, 10240)
+        wire_frames[0] += 1
+        if got != bytes(want):
+            bad = [i // 40 for i in range(10240) if got[i] != want[i]]
+            wire_fail.append('frame %d: displayed wireframe buffer differs from the reference in %d bytes (rows %s...)' % (n, len(bad), sorted(set(bad))[:6]))
+    a.ready_verts = False
+    a.frame_hook = wire_each_frame
     print('running %d frames ...' % args.frames)
     ok = a.run(args.frames, snap_frame)
     mem = a.mem
@@ -554,15 +780,39 @@ def main():
     # ---------------------------------------------------------------- frame pacing
     print('frame pacing')
     fm = a.frame_marks
-    deltas = {(y // FRAME_CYCLES) - (x // FRAME_CYCLES) for x, y in zip(fm, fm[1:])}
+    # (the first interval contains the start-up work and may span two frames)
+    deltas = {(y // FRAME_CYCLES) - (x // FRAME_CYCLES) for x, y in zip(fm[1:], fm[2:])}
     check(deltas == {1}, 'the main loop must advance exactly one frame per iteration, saw frame deltas %s' % sorted(deltas))
     work = [t1 - t0 for t0, t1 in zip(a.exit_times, fm[1:])]
     worst = max(work)
-    window = (FRAME_LINES - 300 + 44) * LINE_CYCLES
-    print('  per-frame CPU work: avg %d, worst %d cycles (%.0f%% of a frame; vblank window %d cycles, no DMA contention modelled)'
-          % (sum(work) // len(work), worst, 100.0 * worst / FRAME_CYCLES, window))
-    if worst > window:
-        print('  NOTE: the worst frame overruns the vblank window, so drawing can still be in progress when the display starts (tearing)')
+    print('  per-frame CPU work: avg %d, worst %d cycles (%.0f%% of a frame; no DMA contention or blitter time modelled)'
+          % (sum(work) // len(work), worst, 100.0 * worst / FRAME_CYCLES))
+    check(worst < 0.85 * FRAME_CYCLES, 'the main loop needs %.0f%% of a frame: too close to dropping frames (and the 50 Hz tracker tick)' % (100.0 * worst / FRAME_CYCLES))
+    # Single-buffered drawing must finish before the beam reaches what it draws. Stars are
+    # drawn first and live in rows 76..195 (display line 120 and below); the scroller strip
+    # starts at display line 244. `scroller` is entered when the stars are done and `wire`
+    # when the scroller is done; both times are measured from the moment the loop left the
+    # frame-sync wait, converted to the beam line it was at.
+    star_slack, scr_slack = [], []
+    for i, t0 in enumerate(a.exit_times[:len(a.t_marks.get('wire', []))]):
+        line0 = (t0 // LINE_CYCLES) % FRAME_LINES
+        lines_to = lambda target: ((FRAME_LINES - line0) + target) * LINE_CYCLES
+        star_slack.append(lines_to(44 + 76) - (a.t_marks['scroller'][i] - t0))
+        scr_slack.append(lines_to(44 + 200) - (a.t_marks['wire'][i] - t0))
+    ts = [m - e for m, e in zip(a.t_marks['scroller'], a.exit_times)]
+    tw = [m - m2 for m, m2 in zip(a.t_marks['wire'], a.t_marks['scroller'])]
+    tall = [t1 - t0 for t0, t1 in zip(a.exit_times, fm[1:])]
+    print('  cost split (avg cycles): mod+raster+stars %d, scroller %d, wireframe+rest %d'
+          % (sum(ts) // len(ts), sum(tw) // len(tw), sum(tall[:len(ts)]) // len(ts) - sum(ts) // len(ts) - sum(tw) // len(tw)))
+    print('  stars finish %d cycles before the beam reaches them (worst frame); scroller %d cycles before its strip'
+          % (min(star_slack), min(scr_slack)))
+    check(min(star_slack) > 0, 'stars are still being drawn when the beam reaches the starfield band (flicker/tearing)')
+    check(min(scr_slack) > 0, 'the scroller is still being shifted when the beam reaches its strip (tearing)')
+    # Wireframe buffers must alternate every frame: the Copper never points at the buffer being drawn.
+    bp = a.bpl2_seen[1:]
+    check(len(set(bp)) == 2 and all(x != y for x, y in zip(bp, bp[1:])),
+          'BPL2PT must alternate between exactly two wireframe buffers every frame, saw %s' % sorted(set(hex(x) for x in bp)))
+    print('  %d line blits and %d band clears issued' % (a.blit_lines, a.blit_clears))
 
     # ---------------------------------------------------------------- audio
     print('audio')
@@ -621,61 +871,75 @@ def main():
     if not check(sn is not None, 'no frame snapshot was taken'):
         finish(); return
     check(sn['terminated'], 'Copper list does not end with $FFFF,$FFFE')
-    check(sn['dmacon'] & 0x3A0 == 0x380 + 0 or (sn['dmacon'] & 0x380) == 0x380, 'master, bitplane and Copper DMA are not all enabled (DMACON=$%04X)' % sn['dmacon'])
+    check((sn['dmacon'] & 0x3C0) == 0x3C0, 'master, bitplane, Copper and blitter DMA are not all enabled (DMACON=$%04X)' % sn['dmacon'])
     check(all(l[3] >= 1 and l[2] != 0 for l in a.latches), 'a channel was started with no sample loaded (Paula would play noise): %s' % [l for l in a.latches if l[3] < 1 or l[2] == 0][:2])
     check(sn['diw'] == (0x2C, 0x12C), 'display window lines %s, expected (44, 300)' % (sn['diw'],))
     scr = mem.r32(a.sym('reloc_table') + 0)
-    for i in range(3):
-        check(sn['ptr'][i] == scr + i * 10240, 'bitplane %d pointer $%X != $%X' % (i, sn['ptr'][i], scr + i * 10240))
-    px = sn['px']
-    def plane_bit(y, x, p):
-        return (px[y][x] >> p) & 1
-    # logo: plane 0, lines 48..111 (screen line = display line - 44 + 44 = same index)
-    logo_bad = 0
-    for y in range(256):
-        for x in range(320):
-            want_bit = 0
-            if 48 <= y < 112:
-                want_bit = (logo[(y - 48) * 40 + (x >> 3)] >> (7 - (x & 7))) & 1
-            if plane_bit(y, x, 0) != want_bit:
-                logo_bad += 1
-    check(logo_bad == 0, 'plane 0 differs from the logo in %d pixels' % logo_bad)
-    # stars: plane 2 holds exactly the 32 stars at their computed positions
-    frames_done = snap_frame                       # UpdateStars has run snap_frame - 1 times before the snapshot
-    nstars_calls = snap_frame - 1
-    want_px = set()
-    x0 = 0
-    for i in range(32):
-        y = 128 + ((x0 * 37) & 63)
-        want_px.add(((x0 + nstars_calls) % 320, y))
-        x0 = (x0 + 73) % 320
-    got_px = {(x, y) for y in range(256) for x in range(320) if plane_bit(y, x, 2)}
-    check(got_px == want_px, 'stars: %d missing, %d unexpected (trails/garbage) of %d' % (len(want_px - got_px), len(got_px - want_px), len(want_px)))
-    # scroller: plane 1, lines 210..225, exact columns from the font
+    P = 10240
+    check(sn['ptr'][0] == scr, 'plane 0 pointer $%X != $%X' % (sn['ptr'][0], scr))
+    check(sn['ptr'][2] == scr + 3 * P, 'plane 2 pointer $%X != $%X' % (sn['ptr'][2], scr + 3 * P))
+    check(sn['ptr'][1] in (scr + P, scr + 2 * P), 'plane 1 pointer $%X is not one of the two wireframe buffers' % sn['ptr'][1])
+    n = snap_frame
+    equ = lambda name: a.consts[name]
+    # ---- expected planes
+    e0, e1, e2 = bytearray(P), bytearray(P), bytearray(P)
+    def setpix(plane, x, y):
+        plane[y * 40 + (x >> 3)] |= 0x80 >> (x & 7)
+    LOGO_Y, LOGO_H, MID_Y0, MID_H = equ('LOGO_Y'), equ('LOGO_H'), equ('MID_Y0'), equ('MID_H')
+    SCROLL_Y = equ('SCROLL_Y')
+    e0[LOGO_Y * 40:(LOGO_Y + LOGO_H) * 40] = logo
+    stars = ref_stars(n - 1, equ('NSTARS'), (equ('ZMIN'), equ('ZRANGE'), equ('ZSPEED'), equ('ZMID'), equ('ZNEAR'),
+                                              equ('PROJ_F'), equ('MID_CX'), equ('MID_CY'), MID_Y0, MID_H))
+    for x, y, cl in stars:
+        if cl & 1: setpix(e2, x, y)
+        if cl & 2: setpix(e0, x, y)
     tb = bytes(mem.r_block(a.sym('scroll_text'), 400)).split(b'\0')[0]
     shifts = sn['shifts']
-    check(shifts == (snap_frame - 1) // 2, 'scroller advanced %d pixels in %d frames, expected %d' % (shifts, snap_frame - 1, (snap_frame - 1) // 2))
-    L = len(tb)
-    def stream_bit(k, row):
-        if k < 0:
+    check(shifts == (n - 1) // 2, 'scroller advanced %d pixels in %d frames, expected %d' % (shifts, n - 1, (n - 1) // 2))
+    def stream_bit(kk, row):
+        if kk < 0:
             return 0
-        ch = tb[(k // 8) % L]
+        ch = tb[(kk // 8) % len(tb)]
         g = ch - 32 if 32 <= ch < 127 else 0
-        return (font[g * 8 + row // 2] >> (7 - (k % 8))) & 1
-    sc_bad = 0
+        return (font[g * 8 + row // 2] >> (7 - (kk % 8))) & 1
     for y in range(16):
         for x in range(320):
-            want_bit = stream_bit(shifts - (319 - x), y)
-            if plane_bit(210 + y, x, 1) != want_bit:
-                sc_bad += 1
-    check(sc_bad == 0, 'scroller band differs from the expected text in %d pixels (shift count %d)' % (sc_bad, shifts))
-    outside = sum(plane_bit(y, x, 1) for y in range(256) for x in range(320) if not 210 <= y < 226)
-    check(outside == 0, 'scroller plane has %d stray pixels outside its band' % outside)
-    # raster colour at line 128 comes from the animated slot
+            if stream_bit(shifts - (319 - x), y):
+                setpix(e0, x, SCROLL_Y + y)
+    verts = [struct.unpack('>3h', mem.r_block(a.sym('verts') + 6 * i, 6)) for i in range(14)]
+    eb = mem.r_block(a.sym('edges'), a.sym('edges_end') - a.sym('edges'))
+    edges = [(eb[i], eb[i + 1]) for i in range(0, len(eb), 2)]
+    wire_ok = n >= 3
+    if wire_ok:
+        pix, proj = ref_wire(n - 2, verts, edges, (equ('WIRE_D'), equ('WIRE_ZOFF'), equ('MID_CX'), equ('MID_CY')))
+        outside = [p for p in pix if not (0 <= p[0] < 320 and MID_Y0 <= p[1] < MID_Y0 + MID_H)]
+        check(not outside, 'the wireframe leaves its %d line band: %s' % (MID_H, outside[:3]))
+        for x, y in pix:
+            if 0 <= x < 320 and 0 <= y < 256:
+                setpix(e1, x, y)
+    def diff(name, got, want):
+        bad = [i for i in range(P) if got[i] != want[i]]
+        rows = sorted({i // 40 for i in bad})
+        check(not bad, '%s differs from the expected image in %d bytes (rows %s...)' % (name, len(bad), rows[:6]))
+        return not bad
+    for m_ in wire_fail:
+        check(False, m_)
+    ok0 = diff('plane 0 (logo + mid stars + scroller)', sn['planes'][0], e0)
+    ok2 = diff('plane 2 (far + near stars)', sn['planes'][2], e2)
+    ok1 = diff('plane 1 (wireframe, displayed buffer)', sn['planes'][1], e1) if wire_ok else True
+    # ---- palette / Copper
+    pbl = sn['pal_by_line']
+    check(pbl[44 + 8][1] == 0xFFF, 'logo top colour $%03X, expected white' % pbl[44 + 8][1])
+    check(pbl[44 + 100][1] == 0xAAD, 'middle band mid-star colour is $%03X, expected $AAD' % pbl[44 + 100][1])
+    check(all(pbl[44 + 100][i] == 0x3FC for i in (2, 3, 6, 7)), 'wireframe colours (2, 3, 6, 7) differ')
+    check(pbl[44 + 222][0] == 0x102, 'Copper wrap below line 255 failed: floor colour at display line 266 is $%03X' % pbl[44 + 222][0])
     pal = [0x102,0x203,0x304,0x405,0x506,0x607,0x708,0x819,0x92A,0xA3B,0xB4C,0xC5D,0xD6E,0xE7F,0xD6E,0xC5D,
            0xB4C,0xA3B,0x92A,0x819,0x708,0x607,0x506,0x405,0x304,0x203,0x102,0x213,0x324,0x435,0x546,0x657]
-    check(sn['pal128'] in pal, 'raster slot colour $%03X is not from the colour table' % sn['pal128'])
-    print('  logo, %d stars and the scroller match their expected pixels' % len(want_px))
+    check(pbl[44 + 73][0] in pal, 'raster slot colour $%03X is not from the colour table' % pbl[44 + 73][0])
+    print('  wireframe buffer verified on each of %d frames' % wire_frames[0])
+    if ok0 and ok1 and ok2 and not wire_fail:
+        print('  logo, %d stars, scroller and the %d-edge wireframe (%d pixels) match the reference models exactly'
+              % (len(stars), len(edges), len(pix) if wire_ok else 0))
     if args.png:
         pal_rgb = lambda v: bytes(((v >> 8) & 15) * 17 for _ in range(1)) + bytes(((v >> 4) & 15) * 17 for _ in range(1)) + bytes((v & 15) * 17 for _ in range(1))
         rows = []

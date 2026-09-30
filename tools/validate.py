@@ -96,7 +96,7 @@ for rel in ('src/main.s','src/modplayer.s'):
             if v is not None:
                 check(1 <= v <= 8,f'{rel}:{n}: immediate count {v} is outside 1..8; use a register or ADD/SUB: {code}')
         # DMACONR, INTENAR, ... are read-only mirrors of the write registers.
-        if re.search(r',\s*(DMACONR|INTENAR|INTREQR|ADKCONR|VPOSR|VHPOSR)\(',code,re.I):
+        if re.search(r',\s*(DMACONR|INTENAR|INTREQR|ADKCONR|VPOSR|VHPOSR)\(',code,re.I) and not re.match(r'^(btst|cmp|cmpi|tst)\b',code,re.I):
             check(False,f'{rel}:{n}: write to a read-only custom register: {code}')
         check('(pc)' not in code.lower() or re.match(r'^(lea|pea|jsr|jmp|bsr)',code,re.I) is not None,
               f'{rel}:{n}: unexpected PC-relative operand: {code}')
@@ -147,7 +147,7 @@ SOURCES=['src/hardware.i','src/main.s','src/modplayer.s']
 MNEMONICS=set("""movem move moveq movea lea pea jsr bsr jmp rts rte bra nop
  bne beq blt bgt ble bge bhi blo bls bhs bcc bcs bpl bmi bvc bvs tst clr cmpi cmp
  add addi addq adda sub subi subq suba and andi or ori eor eori not lsl lsr asl asr
- rol ror roxl roxr btst bset bchg bclr dbra dbf mulu muls swap tas link unlk exg section
+ rol ror roxl roxr neg ext divs divu cmpa btst bset bchg bclr dbra dbf mulu muls swap tas link unlk exg section
  include incbin incsrc cnop even align org ds dc dcb dcd equ set xdef xref export
  import global macro endm rept endr if else endif space skip""".split())
 REGISTERS=set(['d%d'%i for i in range(8)]+['a%d'%i for i in range(7)]+['sp','pc','fp','sr','ccr'])
@@ -281,14 +281,16 @@ for off in reg_offs:
     check(re.search(r'(?<![\d$])%d\(a1\)'%off,patch) is None,f'PatchCopper overwrites register word {off}(a1)')
 check('COP1LCH' in main_src and 'COPJMP1' in main_src,'COP1LCH/COPJMP1 restart missing')
 
-# StarAddress runs 32 times in a row over a single plane base held in a0, so it
-# must address the star without accumulating the byte offset into a0: doing so
-# walks a0 off the end of the bitplane and scribbles over chip memory.
-sa=body_of('StarAddress')
-check(re.search(r'adda\.l\s+d\d,\s*a0',sa) is None and re.search(r'addi\.l\s+#[^,]+,\s*a0',sa) is None,
-      'StarAddress writes a0, but the caller reuses one plane base for all 32 stars')
-check(re.search(r'lea\s+[^,]*\(a0,d\d\.w\),a2',sa) is not None,
-      'StarAddress no longer derives the star address from a0 with an indexed LEA')
+# UpdateStars loops over every star with the two plane bases held in a0/a1, so it must
+# address a star's byte with an indexed operand and never modify the bases: adding an
+# offset into a0/a1 would walk them off the end of the bitplane.
+us=body_of('UpdateStars')
+check(re.search(r'(adda|suba|addq|subq|addi|subi|lea\s+[^,]*),?[^;\n]*\b(a0|a1)\s*$',
+                '\n'.join(l.split(';')[0] for l in us.splitlines() if re.search(r'\b(adda|suba)\b',l))) is None
+      and re.search(r'(?m)^\s*(adda|suba)[^\n]*,\s*a[01]\b',us) is None,
+      'UpdateStars modifies a plane base (a0/a1), which it reuses for every star')
+check(re.search(r'0\(a0,d\d\.w\)',us) is not None and re.search(r'0\(a1,d\d\.w\)',us) is not None,
+      'UpdateStars no longer addresses star bytes with indexed operands on both plane bases')
 code_lo=re.search(r'(?m)^\s*section\s+code\b',main_src)
 code_hi=re.search(r'(?m)^\s*section\s+data\b',main_src)
 check(code_lo is not None and code_hi is not None,'main.s has no code/data section pair')
