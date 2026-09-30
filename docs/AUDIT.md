@@ -33,7 +33,7 @@ tooling or documentation.
 | # | Defect | Fix |
 | --- | --- | --- |
 | 5 | **DMACON bit values wrong** in `hardware.i`: `DMAF_COPPER=$0400`, `DMAF_RASTER=$0200`, `DMAF_MASTER=$0100`. On hardware bit 7 is Copper, bit 8 bitplane, bit 9 master, bit 10 blitter priority. The startup write would have enabled *no* Copper DMA — a black screen | Correct values from `hardware/dmabits.h`; constants asserted by the validator |
-| 6 | `OldOpenLibrary` called with the name in `a0`; it takes `a1`. The same error for `CloseLibrary`, `LoadView`, `FreeMem`, `TypeOfMem` (all `a1`) — the docs said the original code was "fixed" to these wrong registers | All call sites use the real conventions; documented in `hardware.i` |
+| 6 | `OldOpenLibrary` called with the name in `a0`; it takes `a1`. (It is also obsolete: see #30.) The same error for `CloseLibrary`, `LoadView`, `FreeMem`, `TypeOfMem` (all `a1`) — the docs said the original code was "fixed" to these wrong registers | All call sites use the real conventions; documented in `hardware.i` |
 | 7 | `CopyMem` had source and destination swapped (real: `a0` = source, `a1` = dest), and its vector was `-618`; the real offset is `-624` (-618 is another Exec function) | Fixed both; the emulator stub asserts the direction |
 | 8 | `move.l reloc_table(pc),a4` loads the table's first **entry**, not its address, and the loop ran 9 times for 8 entries, re-basing one longword past the table | `lea reloc_table,a4`; count from `RELOC_COUNT-1` |
 | 9 | Audio DMA was enabled in the startup `DMACON` write, before any channel had a sample: `AUDxLEN=0` means 65 536 words, so each channel would replay 128 KB of arbitrary memory as noise until its first note | Audio DMA is left off at start; each channel is enabled by its first note. The emulator asserts that no channel ever starts without a sample |
@@ -65,8 +65,11 @@ tooling or documentation.
 | 25 | `tools/validate.py` | Rejected legal 68000 code on false grounds: memory-to-memory `MOVE`, `ADDA.W`, `BSET Dn,<mem>` are all valid 68000 instructions | Rules removed; VASM is the authority for encodings |
 | 26 | `tools/validate.py` | Missed real defects: symbolic index displacements, PC-relative destinations, `addi` to an address register, out-of-range quick immediates, writes to read-only registers. The argument scanner's look-back window also crossed the previous call, so `a1` set for `FreeMem` satisfied `CloseLibrary` | New rules; scan stops at the previous call. 32 mutants now, all caught |
 | 27 | `Makefile` / repo | Stamp files (`assets/.generated`, `build/.validated`) and `__pycache__` were shipped, and `MANIFEST.sha256` was stale relative to them | `.gitignore`; manifest regenerated |
-| 28 | Whole project | Nothing ran the program. All claims about runtime behaviour were untested | `tools/emu_test.py`: behavioural test on an emulated 68000 |
+| 28 | Whole project | Nothing ran the program. All claims about runtime behaviour were untested | `tools/emu_test.py`: behavioural test on an emulated 68000, and a run in FS-UAE (see "Verified in FS-UAE") |
 | 29 | `tools/bootstrap_vasm.sh` | Failed silently on networks that block HTTPS | Documented `VASM_URL` override |
+| 30 | `main.s` | Found by running under FS-UAE with the AROS ROM: the obsolete `OldOpenLibrary` (LVO −408) raises a `TRAP #11` software failure in AROS before the intro starts | `OpenLibrary` (−552, name in `a1`, version 0 in `d0`) — standard since Kickstart 1.2 |
+| 31 | `main.s` | **ExecBase was passed in `a5`.** The AmigaOS calling convention is that the library base is in `a6` for every call, including Exec. Original Kickstart's Exec never reads it, which hid the bug; AROS's Exec does, and every Exec call crashed (even a program that only calls `Forbid`/`Permit`) | All library calls use `a6`; `emu_test.py` asserts `a6 = base` at every call and `validate.py` rejects any other base register |
+| 32 | `main.s` | **Teardown hung forever.** `Enable()` and `WaitTOF()` ran while `INTENA` still had the vertical-blank interrupt masked (the saved `INTENA` was only restored *after* the waits). `WaitTOF` sleeps until that interrupt fires. The screen went dark and the Shell never came back. This hazard exists on real Kickstart too | `ADKCON`/`INTENA`/`DMACON` are restored before `Enable`/`Permit`/`WaitTOF`; the emulator's `WaitTOF` stub now fails if the VERTB interrupt is masked |
 
 ## Documentation
 
@@ -85,10 +88,25 @@ other Exec/graphics LVOs; `Forbid` → `Disable` and `Enable` → `Permit` order
 layout and the replay core's row/period/sample decoding; the asset generator's unsigned 8-bit
 sample centring; the reproducibility of the generated assets.
 
+## Verified in FS-UAE
+
+The final build was run in FS-UAE 3 (WinUAE core, cycle-exact) configured as an A500 (68000, OCS,
+1 MiB chip + 512 KiB slow RAM, PAL) with the free **AROS** Kickstart replacement ROM (the pair
+shipped in Amiberry's `roms/` directory), the executable on a mounted directory and started from
+a Startup-Sequence. Observed: the logo, raster band, drifting stars and scrolling text render; the
+scroller advances between frames; a left click exits; the AROS Shell prompt returns and the next
+Startup-Sequence command runs. This run found defects #30–#32, none of which the stubbed emulation
+test could see — stubs accept whatever they are given — which is why the test now also enforces the
+register-base and interrupt-mask rules.
+
+What that run does **not** show: audio was not listened to; the machine was AROS, not a real
+Kickstart 1.3/3.x ROM; and no real hardware was used.
+
 ## Remaining risks (not code defects)
 
-- Not run on cycle-exact UAE or real hardware. DMA cycle stealing is not modelled, so the CPU
-  headroom figure is optimistic; the vblank window has ~13 % margin over the worst frame.
+- Not run on real hardware or with a genuine Commodore Kickstart ROM. The FS-UAE run above used
+  AROS. In the emulated-CPU test DMA cycle stealing is not modelled, so the CPU headroom figure is
+  optimistic; the vblank window has ~13 % margin over the worst frame.
 - The unsynchronised custom-register beam read is a single long access, which is correct on a
   68000 but is the kind of thing worth eyeballing on real hardware.
 - No Workbench start-up message handling; start from a Shell.

@@ -96,8 +96,24 @@ a mounted directory or an ADF — and start it **from a Shell/CLI**:
 1> neon_vectors
 ```
 
-Recommended emulator configuration: A500 or A1200 (OCS/ECS chipset is enough), **PAL**, 68000,
-at least 512 KiB chip RAM, Kickstart 1.3 or later. Press the **left mouse button** to exit.
+Recommended emulator configuration: A500 (OCS/ECS chipset is enough), **PAL**, 68000, at least
+512 KiB chip RAM, Kickstart 1.3 or later or the AROS replacement ROM. Press the **left mouse button**
+to exit.
+
+FS-UAE example (`neon.fs-uae`; supply your own ROM paths — the free AROS ROM pair `aros-rom.bin` /
+`aros-ext.bin` ships in Amiberry's `roms/` directory):
+
+```ini
+[fs-uae]
+amiga_model = A500
+chip_memory = 1024
+slow_memory = 512
+kickstart_file = /path/to/aros-rom.bin
+kickstart_ext_file = /path/to/aros-ext.bin
+hard_drive_0 = /path/to/folder-containing-neon_vectors
+```
+
+Create `S/Startup-Sequence` in that folder containing the single line `neon_vectors`.
 
 ## Testing
 
@@ -139,13 +155,15 @@ makes it fail.
 
 **Done in this repository:** the source assembles cleanly with VASM 2.0f; the output is a valid
 Hunk executable (`tools/hunkcheck.py`); the static checks, the mutation self-test and the
-emulated-68000 test all pass.
+emulated-68000 test all pass; and the program was **run in FS-UAE** (cycle-exact, emulated PAL A500)
+with the free AROS Kickstart replacement: the logo, raster band, stars and scroller appear, a left
+click exits, and the Shell prompt returns. That run found three bugs that the stub-based test could
+not (see [`docs/AUDIT.md`](docs/AUDIT.md)).
 
-**Not done:** the program has **not** been run in a cycle-exact Amiga emulator (UAE) or on real
-hardware. The emulation test does not model DMA cycle stealing, the blitter, sprites or
-Kickstart itself, so its CPU timing is optimistic and it cannot prove a display that *looks*
-right on a real monitor. Before calling a release final, run it in FS-UAE/WinUAE/Amiberry with
-cycle-exact chipset emulation and, ideally, on a PAL OCS/ECS machine. The checklist is in
+**Not done:** it has **not** been run with a genuine Commodore Kickstart ROM or on real hardware,
+and audio was not judged by ear. The emulated-CPU test does not model DMA cycle stealing, the
+blitter, sprites or Kickstart itself, so its timing figures are optimistic. Run it on a PAL OCS/ECS
+machine before calling a release final; the checklist is in
 [`docs/BUILD_AND_TEST.md`](docs/BUILD_AND_TEST.md).
 
 ## How it works

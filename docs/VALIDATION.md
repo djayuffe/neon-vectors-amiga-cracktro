@@ -27,7 +27,7 @@ inside x = 1..318.
   hunk), `addi/subi/andi/ori/eori/cmpi` targeting an address register, quick
   add/sub/shift counts outside 1..8, writes to read-only custom registers, explicit short
   branches.
-- Library calls: the register class of every argument (`OldOpenLibrary`/`CloseLibrary`/
+- Library calls: the register class of every argument (`OpenLibrary`/`CloseLibrary`/
   `LoadView`/`FreeMem`/`TypeOfMem` take their pointer in `a1`, `CopyMem` takes `a0` = source and
   `a1` = destination, `AllocMem` takes `d0`/`d1`) must have been set after the previous call;
   the scanner fails if it finds no calls at all.
@@ -53,7 +53,7 @@ word, a wrong silence value, typos in symbols and labels, broken Copper terminat
 labels, direct chip-label use, short branches, symbolic and numeric oversize index
 displacements, PC-relative destination and read, `addi` to `aN`, oversize shift count, a write to
 `DMACONR`, wrong standard/DIW/DMAF/LVO/GfxBase constants, a removed `TypeOfMem` check, and wrong
-argument registers for `CopyMem`, `FreeMem`, `CloseLibrary`, `OldOpenLibrary`, `LoadView`) and
+argument registers for `CopyMem`, `FreeMem`, `CloseLibrary`, `OpenLibrary`, `LoadView`) and
 requires the validator to report each. It exits non-zero if any fault is missed.
 
 ## `tools/emu_test.py`

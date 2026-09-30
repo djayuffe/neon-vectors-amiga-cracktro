@@ -43,11 +43,11 @@ print('=== mutations ===')
 results = []
 M_ = mutate
 results.append(M_('Forbid/Disable swapped', 'src/main.s',
-    '        jsr     LVO_Forbid(a5)\n        jsr     LVO_Disable(a5)',
-    '        jsr     LVO_Disable(a5)\n        jsr     LVO_Forbid(a5)', 'Forbid before Disable'))
+    '        jsr     LVO_Forbid(a6)\n        jsr     LVO_Disable(a6)\n        lea     CUSTOM,a6',
+    '        jsr     LVO_Disable(a6)\n        jsr     LVO_Forbid(a6)\n        lea     CUSTOM,a6', 'Forbid before Disable'))
 results.append(M_('Enable/Permit swapped', 'src/main.s',
-    '        jsr     LVO_Enable(a5)             ; interrupts before any wait\n        jsr     LVO_Permit(a5)',
-    '        jsr     LVO_Permit(a5)\n        jsr     LVO_Enable(a5)', 'Enable before Permit'))
+    '        jsr     LVO_Enable(a6)             ; interrupts before any wait\n        jsr     LVO_Permit(a6)',
+    '        jsr     LVO_Permit(a6)\n        jsr     LVO_Enable(a6)', 'Enable before Permit'))
 results.append(M_('PatchCopper writes register word', 'src/main.s',
     'move.w  d0,6(a1)', 'move.w  d0,4(a1)', 'PatchCopper'))
 results.append(M_('silence word 0 instead of 8080', 'src/main.s',
@@ -96,23 +96,25 @@ results.append(M_('LoadView LVO wrong', 'src/hardware.i',
 results.append(M_('ActiView GfxBase offset wrong', 'src/hardware.i',
     'GfxBase_ActiView  EQU 34', 'GfxBase_ActiView  EQU 30', 'GfxBase offsets'))
 results.append(M_('TypeOfMem check removed', 'src/main.s',
-    '        move.l  d0,a1                      ; TypeOfMem(a1 = address)\n        jsr     LVO_TypeOfMem(a5)', '        move.w  #0,d0', 'MEMF_CHIP'))
+    '        move.l  d0,a1                      ; TypeOfMem(a1 = address)\n        jsr     LVO_TypeOfMem(a6)', '        move.w  #0,d0', 'MEMF_CHIP'))
 results.append(M_('CopyMem source/dest registers', 'src/main.s',
     '        lea     chipdata_begin,a0\n        move.l  chip_base,a1', '        lea     chipdata_begin,d3\n        move.l  chip_base,a1',
     'argument'))
 results.append(M_('FreeMem pointer in a0', 'src/main.s',
-    '        move.l  chip_base,a1               ; FreeMem(a1 = block, d0 = size)\n        move.l  #CHIPDATA_SIZE,d0\n        jsr     LVO_FreeMem(a5)\n\n        move.l  gfx_base,a1',
-    '        move.l  chip_base,a0               ; FreeMem\n        move.l  #CHIPDATA_SIZE,d0\n        jsr     LVO_FreeMem(a5)\n\n        move.l  gfx_base,a1',
+    '        move.l  chip_base,a1               ; FreeMem(a1 = block, d0 = size)\n        move.l  #CHIPDATA_SIZE,d0\n        jsr     LVO_FreeMem(a6)\n\n        move.l  gfx_base,a1',
+    '        move.l  chip_base,a0               ; FreeMem\n        move.l  #CHIPDATA_SIZE,d0\n        jsr     LVO_FreeMem(a6)\n\n        move.l  gfx_base,a1',
     'argument'))
 results.append(M_('CloseLibrary argument in a0', 'src/main.s',
     '        move.l  gfx_base,a1                ; CloseLibrary(a1 = library)', '        move.l  gfx_base,a0                ; CloseLibrary',
     'argument'))
-results.append(M_('OldOpenLibrary name in a0', 'src/main.s',
-    '        lea     gfx_name,a1                 ; OldOpenLibrary(a1 = name, d0 = version)', '        lea     gfx_name,a0                 ; OldOpenLibrary',
+results.append(M_('OpenLibrary name in a0', 'src/main.s',
+    '        lea     gfx_name,a1                 ; OpenLibrary(a1 = name, d0 = version)', '        lea     gfx_name,a0                 ; OpenLibrary',
     'argument'))
 results.append(M_('LoadView(NULL) clears wrong reg', 'src/main.s',
     '        sub.l   a1,a1                      ; LoadView(a1 = NULL) detaches the View', '        sub.l   a0,a0                      ; LoadView',
     'argument'))
+results.append(M_('library base in a5', 'src/main.s',
+    '        jsr     LVO_Forbid(a6)', '        jsr     LVO_Forbid(a5)', 'convention is a6'))
 results.append(M_('CopyMem LVO wrong', 'src/hardware.i',
     'LVO_CopyMem       EQU -624', 'LVO_CopyMem       EQU -618', 'memory/copy/scheduling'))
 results.append(M_('Forbid LVO wrong', 'src/hardware.i',

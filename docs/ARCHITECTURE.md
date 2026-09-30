@@ -9,7 +9,7 @@ does not hang but is mistimed (see "Frame pipeline").
 ## Startup and ownership
 
 1. Save all CPU registers (`movem.l d0-d7/a0-a6`).
-2. Open `graphics.library` with `OldOpenLibrary` (name in `a1`). Save `GfxBase->ActiView`
+2. Open `graphics.library` with `OpenLibrary` (name in `a1`, version 0 in `d0`). Save `GfxBase->ActiView`
    (offset 34) and `GfxBase->copinit` (offset 38), the system Copper start list. `COP1LC` is
    write-only and cannot be read back, so `copinit` is the documented source.
 3. Allocate, verify, copy and re-base the chip-RAM payload (next section). This happens with
@@ -25,9 +25,16 @@ does not hang but is mistimed (see "Frame pipeline").
    the first note that uses it.
 
 On exit: stop Paula, mask interrupts and stop all DMA, `LoadView(old view)`, point `COP1LC` at
-`copinit` and strobe `COPJMP1`, `Enable()` then `Permit()`, two `WaitTOF`, `DisownBlitter`,
-restore `ADKCON`/`INTENA`/`DMACON` from the snapshots as SET writes, free the chip block, close
-the library and restore all registers. Return code 0 (20 if startup failed).
+`copinit` and strobe `COPJMP1`, restore `ADKCON`/`INTENA`/`DMACON` from the snapshots as SET writes,
+then `Enable()` and `Permit()` (in that order), two `WaitTOF`, `DisownBlitter`, free the chip block,
+close the library and restore all registers. Return code 0 (20 if startup failed).
+
+The register restore comes *before* the waits on purpose: `WaitTOF` sleeps until the vertical-blank
+interrupt fires, and that interrupt is still masked from the takeover until `INTENA` is restored.
+Waiting first hangs the machine (the original ordering did).
+
+All library calls pass the library base in `a6`, as every Amiga library expects. Kickstart's Exec
+does not read it, but AROS's does, so a base in any other register crashes there.
 
 Why BPLCON0/1/2 and the modulos are not restored by hand: `LoadView` and the restarted system
 Copper list write them on the next frame; a value captured while another View was active is

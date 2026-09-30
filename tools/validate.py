@@ -325,12 +325,20 @@ check(equvals.get('GfxBase_ActiView')==34 and equvals.get('GfxBase_copinit')==38
 _alloc=body_of('AllocChipMem')
 check('LVO_TypeOfMem' in _alloc and 'MEMF_CHIP' in _alloc,
       'AllocChipMem must verify MEMF_CHIP with TypeOfMem before using the block for DMA')
-check(re.search(r'LVO_TypeOfMem\(a5\)',_alloc) is not None
+check(re.search(r'LVO_TypeOfMem\(a6\)',_alloc) is not None
       and _alloc.find('LVO_TypeOfMem')<_alloc.find('LVO_CopyMem'),
       'the chip memory check must happen before the payload is copied')
 check(re.search(r'jsr\s+LVO_FreeMem',_alloc) is not None,
       'a non-chip allocation must be released with FreeMem rather than leaked')
 check(equvals.get('SILENCE_WORD')==0x8080,'SILENCE_WORD must be $8080 (unsigned 8 bit silence)')
+
+
+# The library base must be in a6 (AmigaOS calling convention). Kickstart's Exec never reads
+# it, which hides a wrong base register; AROS's Exec does and crashes.
+for _n,_l in enumerate(main_src.splitlines(),1):
+    _c=_l.split(';')[0]
+    _m=re.match(r'\s*jsr\s+LVO_\w+\((a[0-7])\)',_c)
+    if _m: check(_m.group(1)=='a6',f'main.s:{_n}: library call with the base in {_m.group(1)}; the convention is a6: {_c.strip()}')
 
 # --- Exec register calling convention ---------------------------------------
 # AmigaOS passes arguments in register order, and the register class is decided
@@ -339,7 +347,7 @@ check(equvals.get('SILENCE_WORD')==0x8080,'SILENCE_WORD must be $8080 (unsigned 
 # not consume a slot. Passing a pointer in d0 (or a length in a0) silently calls
 # the function with garbage, so the class of each argument is checked here.
 LVO_ARGS={
-    'LVO_OldOpenLibrary':['a1','d0'],   # OldOpenLibrary(libName=a1, version=d0)
+    'LVO_OpenLibrary'   :['a1','d0'],   # OpenLibrary(libName=a1, version=d0)
     'LVO_CloseLibrary'  :['a1'],        # CloseLibrary(library=a1)
     'LVO_LoadView'      :['a1'],        # LoadView(view=a1)
     'LVO_AllocMem'      :['d0','d1'],   # AllocMem(byteSize=d0, requirements=d1)
@@ -388,7 +396,7 @@ for callee,base,regs in _calls:
             errors.append(f'{callee} arguments are in the wrong registers: set {",".join(touched)} but expected {",".join(want)}')
 check(equvals.get('LVO_CopyMem')==-624 and equvals.get('LVO_FreeMem')==-210 and equvals.get('LVO_CloseLibrary')==-414
       and equvals.get('LVO_Forbid')==-132 and equvals.get('LVO_Permit')==-138 and equvals.get('LVO_Enable')==-126
-      and equvals.get('LVO_Disable')==-120 and equvals.get('LVO_OldOpenLibrary')==-408,
+      and equvals.get('LVO_Disable')==-120 and equvals.get('LVO_OpenLibrary')==-552,
       'Exec LVO offsets for memory/copy/scheduling calls are wrong')
 
 # --- audio sample sanity ----------------------------------------------------

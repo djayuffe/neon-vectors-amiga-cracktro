@@ -180,12 +180,14 @@ class Amiga:
         mem.w32(GFX + 38, 0x6666)       # copinit
         self.view, self.copinit = 0x5555, 0x6666
         exec_fns = {-120: self.f_disable, -126: self.f_enable, -132: self.f_forbid, -138: self.f_permit,
-                    -198: self.f_allocmem, -210: self.f_freemem, -408: self.f_openlib, -414: self.f_closelib,
+                    -198: self.f_allocmem, -210: self.f_freemem, -552: self.f_openlib, -414: self.f_closelib,
                     -534: self.f_typeofmem, -624: self.f_copymem}
         gfx_fns = {-222: self.f_loadview, -228: self.f_waitblit, -270: self.f_waittof,
                    -456: self.f_ownblit, -462: self.f_disownblit}
         self.stubs = {EXEC + k: v for k, v in exec_fns.items()}
         self.stubs.update({GFX + k: v for k, v in gfx_fns.items()})
+        self.stub_base = {EXEC + k: EXEC for k in exec_fns}
+        self.stub_base.update({GFX + k: GFX for k in gfx_fns})
         self.stub_ranges = [(EXEC - 700, EXEC), (GFX - 500, GFX)]
         # custom register defaults
         mem.w16(CUSTOM + 0x02, self.dmacon); mem.w16(CUSTOM + 0x1C, self.intena)
@@ -264,8 +266,8 @@ class Amiga:
 
     def f_openlib(self):
         name = self.mem.r_cstr(self.reg(R.A1)) if self.reg(R.A1) < 0xE00000 else ''
-        self.calls.append('OldOpenLibrary')
-        ok = check(name == 'graphics.library', 'OldOpenLibrary name pointer (a1) does not point at "graphics.library": %r' % name)
+        self.calls.append('OpenLibrary')
+        ok = check(name == 'graphics.library', 'OpenLibrary name pointer (a1) does not point at "graphics.library": %r' % name)
         self.gfx_open += 1 if ok else 0
         self.scratch(GFX if ok else 0); self.ret()
 
@@ -290,6 +292,7 @@ class Amiga:
 
     def f_waittof(self):
         check(not self.nest_disable, 'WaitTOF with interrupts disabled would hang on real hardware')
+        check((self.intena & 0x4020) == 0x4020, 'WaitTOF would hang: the vertical-blank interrupt is masked (INTENA=$%04X)' % self.intena)
         self.calls.append('WaitTOF')
         self.t = (self.t // FRAME_CYCLES + 1) * FRAME_CYCLES
         self.scratch(); self.ret()
@@ -374,6 +377,11 @@ class Amiga:
             pc = cpu.r_pc()
             fn = self.stubs.get(pc)
             if fn:
+                # AmigaOS convention: the library base is in a6. Kickstart's Exec happens not to
+                # read it, but AROS's does, so a call with the base elsewhere crashes there.
+                if cpu.r_reg(R.A6) != self.stub_base[pc]:
+                    failures.append('library call at $%X made without the library base in a6 (a6=$%X)' % (pc, cpu.r_reg(R.A6)))
+                    return False
                 fn(); continue
             if pc == SENTINEL:
                 break

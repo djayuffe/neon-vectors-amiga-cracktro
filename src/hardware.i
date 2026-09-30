@@ -6,10 +6,10 @@
 ; raw negative displacements so a transposed call cannot be written by accident.
 ;
 ; Register conventions used by the call sites (from the Exec/graphics autodocs):
-;   OldOpenLibrary(a1=name, d0=version)   CloseLibrary(a1=library)
+;   OpenLibrary(a1=name, d0=version)      CloseLibrary(a1=library)
 ;   AllocMem(d0=size, d1=flags)           FreeMem(a1=block, d0=size)
 ;   TypeOfMem(a1=address)                 CopyMem(a0=source, a1=dest, d0=size)
-;   LoadView(a1=view)                     the library base is always in a5/a6
+;   LoadView(a1=view)                     the library base is ALWAYS in a6
 ; ---------------------------------------------------------------------------
 
 CUSTOM      EQU $DFF000
@@ -76,7 +76,7 @@ LVO_Permit        EQU -138
 LVO_AllocMem      EQU -198
 LVO_FreeMem       EQU -210
 LVO_CopyMem       EQU -624
-LVO_OldOpenLibrary EQU -408
+LVO_OpenLibrary    EQU -552
 LVO_CloseLibrary  EQU -414
 LVO_TypeOfMem     EQU -534
 

@@ -34,10 +34,10 @@ _start:
 ; documented system startup list pointer is taken from GfxBase->copinit.
 ; All data below is addressed absolutely: the hunk loader relocates it, whereas
 ; PC-relative addressing cannot reach another hunk and cannot be a destination.
-        move.l  4.w,a5
-        lea     gfx_name,a1                 ; OldOpenLibrary(a1 = name, d0 = version)
-        moveq   #0,d0
-        jsr     LVO_OldOpenLibrary(a5)
+        move.l  4.w,a6
+        lea     gfx_name,a1                 ; OpenLibrary(a1 = name, d0 = version)
+        moveq   #0,d0                       ; (OldOpenLibrary is obsolete and traps under AROS)
+        jsr     LVO_OpenLibrary(a6)
         move.l  d0,gfx_base
         beq     .open_fail
         move.l  d0,a0
@@ -71,9 +71,10 @@ _start:
 
 ; --- take the chipset away from the operating system -----------------------
 ; Forbid() first, so no task switch can happen between Forbid and Disable.
-        move.l  4.w,a5
-        jsr     LVO_Forbid(a5)
-        jsr     LVO_Disable(a5)
+        move.l  4.w,a6                     ; library base travels in a6, as on every Amiga library
+        jsr     LVO_Forbid(a6)
+        jsr     LVO_Disable(a6)
+        lea     CUSTOM,a6
 
         move.w  #$7FFF,INTENA(a6)          ; clear every interrupt enable
         move.w  #$7FFF,INTREQ(a6)          ; acknowledge every interrupt
@@ -124,21 +125,11 @@ _start:
         move.l  d0,COP1LCH(a6)
         move.w  #0,COPJMP1(a6)
 
-        move.l  4.w,a5
-        jsr     LVO_Enable(a5)             ; interrupts before any wait
-        jsr     LVO_Permit(a5)
-
-        move.l  gfx_base,a6
-        jsr     LVO_WaitTOF(a6)
-        jsr     LVO_WaitTOF(a6)
-        jsr     LVO_DisownBlitter(a6)
-
 ; Restore the saved register values as SET/CLR writes, which is the only way
 ; to write the read-side DMACONR/INTENAR/ADKCONR state back. Audio DMA is
 ; deliberately left off: Paula location/length state is not snapshottable.
 ; BPLCON0/1/2 and the modulos are not restored by hand: LoadView and the
 ; restarted system Copper list rewrite them on the next frame.
-        lea     CUSTOM,a6
         move.w  old_adkcon,d0
         andi.w  #$7FFF,d0
         ori.w   #$8000,d0
@@ -152,14 +143,25 @@ _start:
         ori.w   #$8000,d0
         move.w  d0,DMACON(a6)
 
+; The vertical-blank interrupt must be enabled again before the first WaitTOF: WaitTOF
+; sleeps until that interrupt fires, so waiting with INTENA still masked hangs forever.
+        move.l  4.w,a6
+        jsr     LVO_Enable(a6)             ; interrupts before any wait
+        jsr     LVO_Permit(a6)
+
+        move.l  gfx_base,a6
+        jsr     LVO_WaitTOF(a6)
+        jsr     LVO_WaitTOF(a6)
+        jsr     LVO_DisownBlitter(a6)
+
 ; The hardware no longer reads the payload block, so it can be returned.
-        move.l  4.w,a5
+        move.l  4.w,a6
         move.l  chip_base,a1               ; FreeMem(a1 = block, d0 = size)
         move.l  #CHIPDATA_SIZE,d0
-        jsr     LVO_FreeMem(a5)
+        jsr     LVO_FreeMem(a6)
 
         move.l  gfx_base,a1                ; CloseLibrary(a1 = library)
-        jsr     LVO_CloseLibrary(a5)
+        jsr     LVO_CloseLibrary(a6)
         movem.l (sp)+,d0-d7/a0-a6
         moveq   #RETURN_OK,d0
         rts
@@ -170,9 +172,9 @@ _start:
         rts
 
 .alloc_fail:
-        move.l  4.w,a5
+        move.l  4.w,a6
         move.l  gfx_base,a1
-        jsr     LVO_CloseLibrary(a5)
+        jsr     LVO_CloseLibrary(a6)
         movem.l (sp)+,d0-d7/a0-a6
         moveq   #RETURN_FAIL,d0
         rts
@@ -182,10 +184,10 @@ _start:
 ; whole and every label inside it is re-based in one pass.
 ; ---------------------------------------------------------------------------
 AllocChipMem:
-        move.l  4.w,a5
+        move.l  4.w,a6
         move.l  #CHIPDATA_SIZE,d0          ; AllocMem(d0 = size, d1 = flags)
         move.l  #MEMF_CHIP,d1
-        jsr     LVO_AllocMem(a5)
+        jsr     LVO_AllocMem(a6)
         move.l  d0,chip_base
         beq     .no_mem
 
@@ -193,12 +195,12 @@ AllocChipMem:
 ; and Paula DMA cannot be pointed at fast RAM, so a non chip block is a failure
 ; and the memory is handed straight back.
         move.l  d0,a1                      ; TypeOfMem(a1 = address)
-        jsr     LVO_TypeOfMem(a5)
+        jsr     LVO_TypeOfMem(a6)
         andi.l  #MEMF_CHIP,d0
         bne     .have_mem
         move.l  chip_base,a1               ; FreeMem(a1 = block, d0 = size)
         move.l  #CHIPDATA_SIZE,d0
-        jsr     LVO_FreeMem(a5)
+        jsr     LVO_FreeMem(a6)
         clr.l   chip_base
         bra     .no_mem
 .have_mem:
@@ -208,7 +210,7 @@ AllocChipMem:
         lea     chipdata_begin,a0
         move.l  chip_base,a1
         move.l  #CHIPDATA_SIZE,d0
-        jsr     LVO_CopyMem(a5)
+        jsr     LVO_CopyMem(a6)
 
 ; Re-base every long in reloc_table: runtime = base + (assembled - block).
         lea     chipdata_begin,a6
