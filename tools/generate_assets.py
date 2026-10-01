@@ -75,54 +75,22 @@ fraw=b''.join(glyph8(chr(c)) for c in range(32,127))
 (A/'font.raw').write_bytes(fraw)
 
 # ---------- deterministic planar logo ----------
-W,H=320,64
-pix=[[0]*W for _ in range(H)]
-def pset(x,y):
-    if 0<=x<W and 0<=y<H: pix[y][x]=1
-def line(x0,y0,x1,y1):
-    dx=abs(x1-x0); sx=1 if x0<x1 else -1; dy=-abs(y1-y0); sy=1 if y0<y1 else -1; err=dx+dy
-    while True:
-        pset(x0,y0)
-        if x0==x1 and y0==y1: break
-        e2=2*err
-        if e2>=dy: err+=dy; x0+=sx
-        if e2<=dx: err+=dx; y0+=sy
-
-def draw_text(text,x,y,scale=4,advance=6):
-    for ch in text:
-        rows=glyph8(ch)
-        for gy,b in enumerate(rows[:7]):
-            for gx in range(8):
-                if b & (1<<(7-gx)):
-                    for yy in range(scale):
-                        for xx in range(scale): pset(x+gx*scale+xx,y+gy*scale+yy)
-        x += advance*scale
-
-# Two lines: the group name large, the rest of it smaller. A glyph's ink covers
-# columns 1..5 of its 8 pixel cell and each character advances 6 cells, so the
-# ink of n characters is (n-1)*6*scale + 5*scale wide and starts `scale` pixels
-# into the first cell; the text is centred on that ink.
-def centred(text,y,scale):
-    ink=(len(text)-1)*6*scale+5*scale
-    draw_text(text,(W-ink)//2-scale,y,scale)
-centred('UBER',6,5)
-centred('CRACKING SERVICE',46,2)
-for yy in (2,61): line(24,yy,295,yy)
-for x in (14,305):
-    line(x,4,x,59); line(x-4,4,x+4,4); line(x-4,59,x+4,59)
-raw=bytearray()
-for y in range(H):
-    for xb in range(0,W,8):
-        b=0
-        for bit in range(8): b |= pix[y][xb+bit] << (7-bit)
-        raw.append(b)
+# A 320x64 sixteen colour image drawn procedurally by tools/logo_art.py (distance-field letters
+# with bevel lighting, extrusion shadow, chiselled subtitle, wing ornaments), stored as four
+# bitplanes of 40 bytes per row, one after the other (2560 bytes each).
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import logo_art
+W, H = logo_art.W, logo_art.H
+img = logo_art.build()
+raw = b''.join(logo_art.to_planes(img))
 (A/'logo.raw').write_bytes(raw)
 
-# Minimal deterministic grayscale PNG preview.
 def png_chunk(tag,data):
     return struct.pack('>I',len(data))+tag+data+struct.pack('>I',zlib.crc32(tag+data)&0xffffffff)
-scan=b''.join(b'\x00'+bytes(255 if v else 0 for v in row) for row in pix)
-png=b'\x89PNG\r\n\x1a\n'+png_chunk(b'IHDR',struct.pack('>IIBBBBB',W,H,8,0,0,0,0))+png_chunk(b'IDAT',zlib.compress(scan,9))+png_chunk(b'IEND',b'')
+scale=2
+scan=b''.join(b'\x00'+bytes(r) for r in logo_art.preview_rgb(img,scale))
+png=b'\x89PNG\r\n\x1a\n'+png_chunk(b'IHDR',struct.pack('>IIBBBBB',W*scale,H*scale,8,2,0,0,0))+png_chunk(b'IDAT',zlib.compress(scan,9))+png_chunk(b'IEND',b'')
 (A/'logo_preview.png').write_bytes(png)
 
 # ---------- deterministic ProTracker MOD ----------

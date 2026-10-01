@@ -4,7 +4,7 @@ SCREEN_W_BYTES  EQU 40
 SCREEN_H        EQU 256
 PLANE_SIZE      EQU SCREEN_W_BYTES*SCREEN_H
 PLANE_LONGS     EQU PLANE_SIZE/4
-SCREEN_LONGS    EQU PLANE_LONGS*4
+SCREEN_LONGS    EQU PLANE_LONGS*6
 CHIPDATA_SIZE   EQU chipdata_end-chipdata_begin
 FRAME_SYNC_LINE EQU 300     ; first line below the display window (DIWSTOP = line 300)
 SILENCE_WORD    EQU $8080   ; 8 bit Paula silence is unsigned $80, not 0
@@ -329,23 +329,44 @@ ClearScreen:
         dbra    d7,.cs
         rts
 
+; The logo has four planes of LOGO_H rows. Plane 0 and 2 go into their plane, planes 1 and 3
+; into both buffers of their plane (the object code only ever touches the middle band).
 DrawLogo:
         move.l  ptr_logo,a0
         move.l  ptr_screen,a1
-        adda.l  #LOGO_Y*SCREEN_W_BYTES,a1
+        lea     LOGO_Y*SCREEN_W_BYTES(a1),a2
+        bsr     CopyLogoPlane              ; plane 0
+        lea     PLANE_SIZE+LOGO_Y*SCREEN_W_BYTES(a1),a2
+        bsr     CopyLogoPlane              ; plane 1, buffer 0
+        lea     -(SCREEN_W_BYTES*LOGO_H)(a0),a0
+        lea     PLANE_SIZE*2+LOGO_Y*SCREEN_W_BYTES(a1),a2
+        bsr     CopyLogoPlane              ; plane 1, buffer 1
+        lea     PLANE_SIZE*3+LOGO_Y*SCREEN_W_BYTES(a1),a2
+        bsr     CopyLogoPlane              ; plane 2
+        move.l  a1,a2
+        adda.l  #PLANE_SIZE*4+LOGO_Y*SCREEN_W_BYTES,a2
+        bsr     CopyLogoPlane              ; plane 3, buffer 0
+        lea     -(SCREEN_W_BYTES*LOGO_H)(a0),a0
+        move.l  a1,a2
+        adda.l  #PLANE_SIZE*5+LOGO_Y*SCREEN_W_BYTES,a2
+        bsr     CopyLogoPlane              ; plane 3, buffer 1
+        rts
+
+; in: a0 = source (advanced past the plane), a2 = destination
+CopyLogoPlane:
         move.w  #(SCREEN_W_BYTES*LOGO_H/4)-1,d7
-.dl:
-        move.l  (a0)+,(a1)+
-        dbra    d7,.dl
+.c:
+        move.l  (a0)+,(a2)+
+        dbra    d7,.c
         rts
 
 ; Rewrite the three bitplane pointer pairs in the copied Copper list. The list is
 ; stored as MOVE pairs, so the register words sit at byte offsets 0/4/8/12/16/20
 ; and the data words that PatchCopper overwrites at 2/6, 10/14 and 18/22.
 ; The Copper plane pointers are 2 bytes before the plane (the extra fetch word). The
-; screen block holds plane 0, wireframe buffer 0, wireframe buffer 1 and
-; plane 2, in that order; plane 1 of the display is whichever wireframe buffer is
-; currently in front.
+; screen block holds plane 0, the two buffers of plane 1, plane 2 and the two buffers
+; of plane 3, in that order; planes 1 and 3 (the 3D object planes) are double-buffered
+; and the display uses whichever buffer of each is currently in front.
 PatchCopper:
         move.l  ptr_cop_bpl1,a1
         move.l  ptr_screen,d3
@@ -359,7 +380,7 @@ PatchCopper:
         addq.w  #1,d0
         mulu    #PLANE_SIZE,d0
         add.l   d3,d0
-        move.w  d0,14(a1)                  ; BPL2PTL
+        move.w  d0,14(a1)                  ; BPL2PTL: plane 1, the front buffer
         swap    d0
         move.w  d0,10(a1)                  ; BPL2PTH
         move.l  d3,d0
@@ -367,6 +388,14 @@ PatchCopper:
         move.w  d0,22(a1)                  ; BPL3PTL
         swap    d0
         move.w  d0,18(a1)                  ; BPL3PTH
+        moveq   #0,d0
+        move.w  wire_front,d0
+        addq.w  #4,d0
+        mulu    #PLANE_SIZE,d0
+        add.l   d3,d0
+        move.w  d0,30(a1)                  ; BPL4PTL: plane 3, the front buffer
+        swap    d0
+        move.w  d0,26(a1)                  ; BPL4PTH
         rts
 
 ; Flip the wireframe buffers and point the Copper at the one drawn last frame.
@@ -1211,87 +1240,96 @@ chipdata_begin:
 copper:
         dc.w DIWSTRT,$2C81,DIWSTOP,$2CC1
         dc.w DDFSTRT,$0030,DDFSTOP,$00D0   ; one extra word per line (BPLCON1 scroll), see BPLxMOD
-        dc.w BPLCON0,$3200,BPLCON1,$0000,BPLCON2,$0000
+        dc.w BPLCON0,$4200,BPLCON1,$0000,BPLCON2,$0000   ; 4 bitplanes, 16 colours
         dc.w BPL1MOD,$FFFE,BPL2MOD,$FFFE   ; 21 words fetched, 20 words per line: step back 2 bytes
 cop_bpl1:
         dc.w BPL1PTH,0,BPL1PTL,0
         dc.w BPL2PTH,0,BPL2PTL,0
         dc.w BPL3PTH,0,BPL3PTL,0
-        dc.w COLOR00,$001,COLOR01,$FFF,COLOR02,$3FC,COLOR03,$3FC
-        dc.w COLOR04,$779,COLOR05,$FFF,COLOR06,$3FC,COLOR07,$3FC
-; Colour gradients per raster line (tools/gen_tables.py copper). COLOR01 is
-; the text colour in the logo and scroller bands and the mid-distance star colour
-; in the middle band; COLOR02/03/06/07 are the wireframe colour (plane 1), so the
-; wireframe stays in front of any star drawn behind it.
+        dc.w BPL4PTH,0,BPL4PTL,0
+; The logo's 16 colour palette (tools/gen_tables.py palette); the Copper reloads a
+; different palette below the logo for the stars and objects.
+        dc.w COLOR00,$001,COLOR01,$100,COLOR02,$631,COLOR03,$963
+        dc.w COLOR04,$FC4,COLOR05,$FE9,COLOR06,$FFC,COLOR07,$FFF
+        dc.w COLOR08,$424,COLOR09,$212,COLOR10,$246,COLOR11,$468
+        dc.w COLOR12,$6AC,COLOR13,$ADF,COLOR14,$D42,COLOR15,$FFF
+; Colour work per raster line (tools/gen_tables.py copper). In the logo band COLOR00 and
+; COLOR04 get a gradient on every row; below it the palette is reloaded: COLOR01 is the
+; mid-distance star, COLOR04/05 the far and near stars, and any index with bitplane 1 or 3
+; set belongs to the 3D objects, so an object always hides the stars behind it.
 cop_wave:                                   ; 64 rows, 16 bytes each (BPLCON1 value at +14)
-        dc.w $3401,$FFFE,COLOR00,$0002,COLOR01,$0FFF,BPLCON1,$0088
-        dc.w $3501,$FFFE,COLOR00,$0002,COLOR01,$0FFF,BPLCON1,$0088
-        dc.w $3601,$FFFE,COLOR00,$0002,COLOR01,$0FFE,BPLCON1,$0088
-        dc.w $3701,$FFFE,COLOR00,$0002,COLOR01,$0FFE,BPLCON1,$0088
-        dc.w $3801,$FFFE,COLOR00,$0002,COLOR01,$0FFE,BPLCON1,$0088
-        dc.w $3901,$FFFE,COLOR00,$0002,COLOR01,$0FFE,BPLCON1,$0088
-        dc.w $3A01,$FFFE,COLOR00,$0002,COLOR01,$0FFD,BPLCON1,$0088
-        dc.w $3B01,$FFFE,COLOR00,$0002,COLOR01,$0FFD,BPLCON1,$0088
-        dc.w $3C01,$FFFE,COLOR00,$0002,COLOR01,$0FFD,BPLCON1,$0088
-        dc.w $3D01,$FFFE,COLOR00,$0002,COLOR01,$0FFD,BPLCON1,$0088
-        dc.w $3E01,$FFFE,COLOR00,$0002,COLOR01,$0FFC,BPLCON1,$0088
-        dc.w $3F01,$FFFE,COLOR00,$0002,COLOR01,$0FFC,BPLCON1,$0088
-        dc.w $4001,$FFFE,COLOR00,$0002,COLOR01,$0FFC,BPLCON1,$0088
-        dc.w $4101,$FFFE,COLOR00,$0002,COLOR01,$0FFB,BPLCON1,$0088
-        dc.w $4201,$FFFE,COLOR00,$0002,COLOR01,$0FFB,BPLCON1,$0088
-        dc.w $4301,$FFFE,COLOR00,$0002,COLOR01,$0FFB,BPLCON1,$0088
-        dc.w $4401,$FFFE,COLOR00,$0103,COLOR01,$0FFB,BPLCON1,$0088
-        dc.w $4501,$FFFE,COLOR00,$0103,COLOR01,$0FFA,BPLCON1,$0088
-        dc.w $4601,$FFFE,COLOR00,$0103,COLOR01,$0FFA,BPLCON1,$0088
-        dc.w $4701,$FFFE,COLOR00,$0103,COLOR01,$0FFA,BPLCON1,$0088
-        dc.w $4801,$FFFE,COLOR00,$0103,COLOR01,$0FFA,BPLCON1,$0088
-        dc.w $4901,$FFFE,COLOR00,$0103,COLOR01,$0FF9,BPLCON1,$0088
-        dc.w $4A01,$FFFE,COLOR00,$0103,COLOR01,$0FF9,BPLCON1,$0088
-        dc.w $4B01,$FFFE,COLOR00,$0103,COLOR01,$0FF9,BPLCON1,$0088
-        dc.w $4C01,$FFFE,COLOR00,$0103,COLOR01,$0FF8,BPLCON1,$0088
-        dc.w $4D01,$FFFE,COLOR00,$0103,COLOR01,$0FE8,BPLCON1,$0088
-        dc.w $4E01,$FFFE,COLOR00,$0103,COLOR01,$0FE8,BPLCON1,$0088
-        dc.w $4F01,$FFFE,COLOR00,$0103,COLOR01,$0FE7,BPLCON1,$0088
-        dc.w $5001,$FFFE,COLOR00,$0103,COLOR01,$0FD7,BPLCON1,$0088
-        dc.w $5101,$FFFE,COLOR00,$0103,COLOR01,$0FD7,BPLCON1,$0088
-        dc.w $5201,$FFFE,COLOR00,$0103,COLOR01,$0FD6,BPLCON1,$0088
-        dc.w $5301,$FFFE,COLOR00,$0103,COLOR01,$0FD6,BPLCON1,$0088
-        dc.w $5401,$FFFE,COLOR00,$0113,COLOR01,$0FC6,BPLCON1,$0088
-        dc.w $5501,$FFFE,COLOR00,$0113,COLOR01,$0FC6,BPLCON1,$0088
-        dc.w $5601,$FFFE,COLOR00,$0113,COLOR01,$0FC5,BPLCON1,$0088
-        dc.w $5701,$FFFE,COLOR00,$0113,COLOR01,$0FC5,BPLCON1,$0088
-        dc.w $5801,$FFFE,COLOR00,$0113,COLOR01,$0FB5,BPLCON1,$0088
-        dc.w $5901,$FFFE,COLOR00,$0113,COLOR01,$0FB4,BPLCON1,$0088
-        dc.w $5A01,$FFFE,COLOR00,$0113,COLOR01,$0FB4,BPLCON1,$0088
-        dc.w $5B01,$FFFE,COLOR00,$0113,COLOR01,$0FB4,BPLCON1,$0088
-        dc.w $5C01,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
-        dc.w $5D01,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
-        dc.w $5E01,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
-        dc.w $5F01,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
-        dc.w $6001,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
-        dc.w $6101,$FFFE,COLOR00,$0113,COLOR01,$0F93,BPLCON1,$0088
-        dc.w $6201,$FFFE,COLOR00,$0113,COLOR01,$0F93,BPLCON1,$0088
-        dc.w $6301,$FFFE,COLOR00,$0113,COLOR01,$0F93,BPLCON1,$0088
-        dc.w $6401,$FFFE,COLOR00,$0214,COLOR01,$0F93,BPLCON1,$0088
-        dc.w $6501,$FFFE,COLOR00,$0214,COLOR01,$0F83,BPLCON1,$0088
-        dc.w $6601,$FFFE,COLOR00,$0214,COLOR01,$0F83,BPLCON1,$0088
-        dc.w $6701,$FFFE,COLOR00,$0214,COLOR01,$0E83,BPLCON1,$0088
-        dc.w $6801,$FFFE,COLOR00,$0214,COLOR01,$0E83,BPLCON1,$0088
-        dc.w $6901,$FFFE,COLOR00,$0214,COLOR01,$0E73,BPLCON1,$0088
-        dc.w $6A01,$FFFE,COLOR00,$0214,COLOR01,$0E73,BPLCON1,$0088
-        dc.w $6B01,$FFFE,COLOR00,$0214,COLOR01,$0E73,BPLCON1,$0088
-        dc.w $6C01,$FFFE,COLOR00,$0214,COLOR01,$0E73,BPLCON1,$0088
-        dc.w $6D01,$FFFE,COLOR00,$0214,COLOR01,$0E62,BPLCON1,$0088
-        dc.w $6E01,$FFFE,COLOR00,$0214,COLOR01,$0E62,BPLCON1,$0088
-        dc.w $6F01,$FFFE,COLOR00,$0214,COLOR01,$0E62,BPLCON1,$0088
-        dc.w $7001,$FFFE,COLOR00,$0214,COLOR01,$0E62,BPLCON1,$0088
-        dc.w $7101,$FFFE,COLOR00,$0214,COLOR01,$0E52,BPLCON1,$0088
-        dc.w $7201,$FFFE,COLOR00,$0214,COLOR01,$0E52,BPLCON1,$0088
-        dc.w $7301,$FFFE,COLOR00,$0214,COLOR01,$0E52,BPLCON1,$0088
+        dc.w $3401,$FFFE,COLOR00,$0002,COLOR04,$0FFF,BPLCON1,$0088
+        dc.w $3501,$FFFE,COLOR00,$0002,COLOR04,$0FFF,BPLCON1,$0088
+        dc.w $3601,$FFFE,COLOR00,$0002,COLOR04,$0FFF,BPLCON1,$0088
+        dc.w $3701,$FFFE,COLOR00,$0002,COLOR04,$0FFF,BPLCON1,$0088
+        dc.w $3801,$FFFE,COLOR00,$0002,COLOR04,$0FFF,BPLCON1,$0088
+        dc.w $3901,$FFFE,COLOR00,$0002,COLOR04,$0FFE,BPLCON1,$0088
+        dc.w $3A01,$FFFE,COLOR00,$0002,COLOR04,$0FFD,BPLCON1,$0088
+        dc.w $3B01,$FFFE,COLOR00,$0002,COLOR04,$0FFD,BPLCON1,$0088
+        dc.w $3C01,$FFFE,COLOR00,$0002,COLOR04,$0FFC,BPLCON1,$0088
+        dc.w $3D01,$FFFE,COLOR00,$0002,COLOR04,$0FEB,BPLCON1,$0088
+        dc.w $3E01,$FFFE,COLOR00,$0002,COLOR04,$0FEA,BPLCON1,$0088
+        dc.w $3F01,$FFFE,COLOR00,$0002,COLOR04,$0FEA,BPLCON1,$0088
+        dc.w $4001,$FFFE,COLOR00,$0002,COLOR04,$0FE9,BPLCON1,$0088
+        dc.w $4101,$FFFE,COLOR00,$0002,COLOR04,$0FE8,BPLCON1,$0088
+        dc.w $4201,$FFFE,COLOR00,$0002,COLOR04,$0FE8,BPLCON1,$0088
+        dc.w $4301,$FFFE,COLOR00,$0002,COLOR04,$0FD7,BPLCON1,$0088
+        dc.w $4401,$FFFE,COLOR00,$0103,COLOR04,$0FD7,BPLCON1,$0088
+        dc.w $4501,$FFFE,COLOR00,$0103,COLOR04,$0FD6,BPLCON1,$0088
+        dc.w $4601,$FFFE,COLOR00,$0103,COLOR04,$0FD6,BPLCON1,$0088
+        dc.w $4701,$FFFE,COLOR00,$0103,COLOR04,$0FC5,BPLCON1,$0088
+        dc.w $4801,$FFFE,COLOR00,$0103,COLOR04,$0FC5,BPLCON1,$0088
+        dc.w $4901,$FFFE,COLOR00,$0103,COLOR04,$0FC4,BPLCON1,$0088
+        dc.w $4A01,$FFFE,COLOR00,$0103,COLOR04,$0FC4,BPLCON1,$0088
+        dc.w $4B01,$FFFE,COLOR00,$0103,COLOR04,$0FB3,BPLCON1,$0088
+        dc.w $4C01,$FFFE,COLOR00,$0103,COLOR04,$0FB3,BPLCON1,$0088
+        dc.w $4D01,$FFFE,COLOR00,$0103,COLOR04,$0FB3,BPLCON1,$0088
+        dc.w $4E01,$FFFE,COLOR00,$0103,COLOR04,$0FA3,BPLCON1,$0088
+        dc.w $4F01,$FFFE,COLOR00,$0103,COLOR04,$0FA3,BPLCON1,$0088
+        dc.w $5001,$FFFE,COLOR00,$0103,COLOR04,$0F93,BPLCON1,$0088
+        dc.w $5101,$FFFE,COLOR00,$0103,COLOR04,$0F93,BPLCON1,$0088
+        dc.w $5201,$FFFE,COLOR00,$0103,COLOR04,$0F93,BPLCON1,$0088
+        dc.w $5301,$FFFE,COLOR00,$0103,COLOR04,$0F83,BPLCON1,$0088
+        dc.w $5401,$FFFE,COLOR00,$0113,COLOR04,$0E82,BPLCON1,$0088
+        dc.w $5501,$FFFE,COLOR00,$0113,COLOR04,$0E82,BPLCON1,$0088
+        dc.w $5601,$FFFE,COLOR00,$0113,COLOR04,$0E72,BPLCON1,$0088
+        dc.w $5701,$FFFE,COLOR00,$0113,COLOR04,$0E72,BPLCON1,$0088
+        dc.w $5801,$FFFE,COLOR00,$0113,COLOR04,$0E62,BPLCON1,$0088
+        dc.w $5901,$FFFE,COLOR00,$0113,COLOR04,$0E62,BPLCON1,$0088
+        dc.w $5A01,$FFFE,COLOR00,$0113,COLOR04,$0E62,BPLCON1,$0088
+        dc.w $5B01,$FFFE,COLOR00,$0113,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $5C01,$FFFE,COLOR00,$0113,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $5D01,$FFFE,COLOR00,$0113,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $5E01,$FFFE,COLOR00,$0113,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $5F01,$FFFE,COLOR00,$0113,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6001,$FFFE,COLOR00,$0113,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6101,$FFFE,COLOR00,$0113,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6201,$FFFE,COLOR00,$0113,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6301,$FFFE,COLOR00,$0113,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6401,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6501,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6601,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6701,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6801,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6901,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6A01,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6B01,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6C01,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6D01,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6E01,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $6F01,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $7001,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $7101,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $7201,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
+        dc.w $7301,$FFFE,COLOR00,$0214,COLOR04,$0E52,BPLCON1,$0088
         dc.w $7401,$FFFE                    ; y=72: animated slot, then the wave ends
 cop_raster_color:
         dc.w COLOR00,$013                   ; animated by UpdateRaster each frame
         dc.w BPLCON1,$0000
+        dc.w COLOR01,$AAD,COLOR02,$3FC,COLOR03,$3FC,COLOR04,$779
+        dc.w COLOR05,$FFF,COLOR06,$3FC,COLOR07,$3FC,COLOR08,$39F
+        dc.w COLOR09,$39F,COLOR10,$9FF,COLOR11,$9FF,COLOR12,$39F
+        dc.w COLOR13,$39F,COLOR14,$9FF,COLOR15,$9FF
         dc.w $7801,$FFFE,COLOR00,$0001,COLOR01,$0AAD
         dc.w $8001,$FFFE,COLOR00,$0001
         dc.w $8801,$FFFE,COLOR00,$0012
@@ -1360,7 +1398,7 @@ cop_bars:                                   ; 34 rows of WAIT + COLOR00, 8 bytes
 
         cnop 0,4
         dc.l 0                      ; the word fetched left of line 0 (planes start 2 bytes early)
-screen:     ds.b PLANE_SIZE*4   ; plane 0 | wireframe buffer 0 | wireframe buffer 1 | plane 2
+screen:     ds.b PLANE_SIZE*6   ; plane 0 | plane 1 buffers 0,1 | plane 2 | plane 3 buffers 0,1
 logo_data:  incbin "assets/logo.raw"
 font_data:  incbin "assets/font.raw"
         even

@@ -6,7 +6,9 @@ errors=[]
 def check(c,m):
     if not c: errors.append(m)
 logo=(ROOT/'assets/logo.raw').read_bytes(); font=(ROOT/'assets/font.raw').read_bytes(); mod=(ROOT/'assets/neon.mod').read_bytes()
-check(len(logo)==320//8*64, f'logo size {len(logo)} != 2560')
+check(len(logo)==4*320//8*64, f'logo size {len(logo)} != 10240 (four 2560 byte bitplanes)')
+logo_planes=[logo[i*2560:(i+1)*2560] for i in range(4)]
+logo_any=bytes(a|b|c|d for a,b,c,d in zip(*logo_planes)) if len(logo)==10240 else bytes(2560)
 check(len(font)==95*8, f'font size {len(font)} != 760')
 check(len(mod)>=1084,'MOD shorter than header')
 if len(mod)>=1084:
@@ -253,7 +255,7 @@ for i in range(0,len(cop_words)-1,2):
     else:                                             # MOVE reg, value (a value of $FFFE is legal)
         check(0<=val<=0xFFFF,f'Copper MOVE to ${reg:04X} has out of range value {val}')
         check(reg>=0x20 and reg<=0x1FE,f'Copper MOVE to ${reg:04X} is outside the custom register range')
-for reg,val in ((0x08E,0x2C81),(0x090,0x2CC1),(0x092,0x0030),(0x094,0x00D0),(0x100,0x3200),(0x108,0xFFFE),(0x10A,0xFFFE)):
+for reg,val in ((0x08E,0x2C81),(0x090,0x2CC1),(0x092,0x0030),(0x094,0x00D0),(0x100,0x4200),(0x108,0xFFFE),(0x10A,0xFFFE)):
     pairs=[(cop_words[i],cop_words[i+1]) for i in range(0,len(cop_words)-1,2)]
     check((reg,val) in pairs,f'Copper list missing standard value ${reg:03X}=${val:04X}')
 check(any(cop_words[i]==0x180 for i in range(0,len(cop_words),2)),'Copper list never sets COLOR00')
@@ -271,10 +273,10 @@ check(re.match(r'\s*dc\.w\s+COLOR00\s*,\s*\$[0-9A-Fa-f]{1,4}',slot) is not None,
 # skipping the pairs would leave the bitplanes pointing at the link time block.
 bpl_lo=label_pos('cop_bpl1:'); col=main_src.find('COLOR00',bpl_lo)
 bpl_regs=[equvals.get(t) for t in re.findall(r'BPL\dPT[HL]',main_src[bpl_lo:col])]
-check(bpl_regs==[0x0E0,0x0E2,0x0E4,0x0E6,0x0E8,0x0EA],
-      f'cop_bpl1 does not start with the BPL1..3 pointer pairs: {bpl_regs}')
-data_offs=[2*(2*k+1) for k in range(3*2)]
-reg_offs=[2*(2*k) for k in range(3*2)]
+check(bpl_regs==[0x0E0,0x0E2,0x0E4,0x0E6,0x0E8,0x0EA,0x0EC,0x0EE],
+      f'cop_bpl1 does not start with the BPL1..4 pointer pairs: {bpl_regs}')
+data_offs=[2*(2*k+1) for k in range(4*2)]
+reg_offs=[2*(2*k) for k in range(4*2)]
 patch=body_of('PatchCopper')
 for off in data_offs:
     check(re.search(r'(?<![\d$])%d\(a1\)'%off,patch) is not None,f'PatchCopper does not patch data offset {off}(a1)')
@@ -430,12 +432,12 @@ if len(mod)>=1084:
 # --- logo geometry ----------------------------------------------------------
 # A logo wider than 320 pixels is clipped on both sides, which is invisible in
 # the raw file but obvious on screen.
-logo_cols=[x for x in range(320) if any(logo[y*40+(x>>3)]>>(7-(x&7))&1 for y in range(64))]
+logo_cols=[x for x in range(320) if any(logo_any[y*40+(x>>3)]>>(7-(x&7))&1 for y in range(64))]
 check(bool(logo_cols),'logo is empty')
 if logo_cols:
     check(min(logo_cols)>=1 and max(logo_cols)<=318,
           f'logo ink spans x={min(logo_cols)}..{max(logo_cols)}, too wide for a 320 pixel screen')
-    rows=[y for y in range(64) if any(logo[y*40+x] for x in range(40))]
+    rows=[y for y in range(64) if any(logo_any[y*40+x] for x in range(40))]
     check(min(rows)>=1 and max(rows)<=62,f'logo ink spans y={min(rows)}..{max(rows)}, outside the 64 pixel band')
     for ch in (32,33,65,77,86):
         cell=font[ch*8:ch*8+8]

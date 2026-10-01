@@ -76,7 +76,7 @@ results.append(M_('PC-relative destination', 'src/main.s',
 results.append(M_('PC-relative read of another hunk', 'src/main.s',
     '        move.l  gfx_base,a6\n        sub.l', '        move.l  gfx_base(pc),a6\n        sub.l', 'PC-relative'))
 results.append(M_('ADDI to an address register', 'src/main.s',
-    '        adda.l  #LOGO_Y*SCREEN_W_BYTES,a1', '        addi.l  #LOGO_Y*SCREEN_W_BYTES,a1', 'address register'))
+    '        adda.l  #PLANE_SIZE*4+LOGO_Y*SCREEN_W_BYTES,a2', '        addi.l  #PLANE_SIZE*4+LOGO_Y*SCREEN_W_BYTES,a2', 'address register'))
 results.append(M_('quick shift count above 8', 'src/modplayer.s',
     '        rol.l   #8,d2', '        lsr.l   #24,d2', 'outside 1..8'))
 results.append(M_('write to DMACONR', 'src/main.s',

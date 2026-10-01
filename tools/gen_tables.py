@@ -6,6 +6,7 @@
     python3 tools/gen_tables.py recip_star | recip_wire   # reciprocal tables that replace divisions
     python3 tools/gen_tables.py floor_base | bar_colors   # copper-bar floor tables
     python3 tools/gen_tables.py wave_tab                  # BPLCON1 values of the wavy logo
+    python3 tools/gen_tables.py palette                   # the logo's 16 colour palette (Copper header)
 
 The output is deterministic. It is kept as a script (rather than generated at build
 time) so the assembler input stays a single readable file that the validator can parse.
@@ -26,6 +27,7 @@ def ramp(stops, t):
             return lerp(c0, c1, 0 if p1 == p0 else (t - p0) / (p1 - p0))
     return stops[-1][1]
 
+import logo_art
 DISPLAY_TOP = 44            # first display line; screen y maps to line y + 44
 
 FLOOR_Y0, FLOOR_H = 222, 34          # copper-bar floor: rows 222..255, one WAIT per row
@@ -46,15 +48,35 @@ def bar_colors():
             out.append(lerp(0x001, base, pk / 4))
     return out
 
+MID_PALETTE = [0x001, 0xAAD, 0x3FC, 0x3FC, 0x779, 0xFFF, 0x3FC, 0x3FC,
+               0x39F, 0x39F, 0x9FF, 0x9FF, 0x39F, 0x39F, 0x9FF, 0x9FF]
+# index = plane0 + 2*plane1 + 4*plane2 + 8*plane3:
+#   1 mid star | 4 far star | 5 near star | planes 1 or 3 set: object shades (1: wire / shade 1,
+#   3 only: shade 2, 1 and 3: shade 3), so an object always hides the stars behind it.
+
+def fmt_palette(pal, first=0):
+    """dc.w lines that load pal[first:] into COLOR<first>.. (four MOVEs per line)."""
+    out = []
+    for i in range(first, 16, 4):
+        out.append('        dc.w ' + ','.join('COLOR%02d,$%03X' % (i + k, pal[i + k]) for k in range(4) if i + k < 16))
+    return '\n'.join(out)
+
+def mid_palette():
+    """Palette reload for the middle band (COLOR00 is left to the animated bar slot)."""
+    return fmt_palette(MID_PALETTE, 1)
+
+def header_palette():
+    return fmt_palette(logo_art.PALETTE, 0)
+
 def copper():
     ent = []                # (y, regs) ; regs None = animated slot, 'wave' = wavy logo row, 'bar' = floor row
-    # Logo band, y 8..71: text colour (COLOR01) and background (COLOR00) shade every row, and each
-    # row has a BPLCON1 move that UpdateWave rewrites every frame (a sine wave of horizontal scroll).
-    text = [(0.0, 0xFFF), (0.35, 0xFF9), (0.6, 0xFB4), (1.0, 0xE52)]
+    # Logo band, y 8..71: a 16 colour picture whose palette is in the Copper header. Every row
+    # recolours the background (COLOR00) and the face colour (COLOR04: a white-to-orange metal
+    # gradient) and has a BPLCON1 move that UpdateWave rewrites every frame.
+    face = [(0.0, 0xFFF), (0.25, 0xFE8), (0.55, 0xFB3), (1.0, 0xE52)]
     bg = [(0.0, 0x002), (1.0, 0x214)]
     for i in range(64):
-        t = i / 63
-        ent.append((8 + i, [('COLOR00', ramp(bg, t)), ('COLOR01', ramp(text, t)), ('BPLCON1', 0x88)]))
+        ent.append((8 + i, [('COLOR00', ramp(bg, i / 63)), ('COLOR04', ramp(face, max(0.0, min(1.0, (i - 4) / 36)))), ('BPLCON1', 0x88)]))
     ent.append((72, None))                                   # animated raster slot, then the wave reset
     # Middle band, y 76..195: mid-distance star colour plus a soft glow behind.
     ent.append((76, [('COLOR00', 0x001), ('COLOR01', 0xAAD)]))
@@ -88,6 +110,7 @@ def copper():
             lines.append('cop_raster_color:')
             lines.append('        dc.w COLOR00,$013                   ; animated by UpdateRaster each frame')
             lines.append('        dc.w BPLCON1,$0000')
+            lines.append(mid_palette())
         elif isinstance(regs, tuple):
             if first_bar:
                 lines.append('cop_bars:                                   ; 34 rows of WAIT + COLOR00, 8 bytes each (value at +6)')
@@ -131,4 +154,4 @@ def sintab():
 if __name__ == '__main__':
     print({'copper': copper, 'sintab': sintab, 'recip_star': recip_star, 'recip_wire': recip_wire,
            'floor_base': lambda: words(floor_base()), 'bar_colors': lambda: words(bar_colors(), 8),
-           'wave_tab': lambda: words(wave_tab())}[sys.argv[1]]())
+           'wave_tab': lambda: words(wave_tab()), 'palette': header_palette}[sys.argv[1]]())

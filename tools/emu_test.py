@@ -32,6 +32,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gen_tables
 LINE_CYCLES = 454                 # 227 colour clocks * 2 CPU cycles at 7.09 MHz
 FRAME_LINES = 312
 FRAME_CYCLES = LINE_CYCLES * FRAME_LINES
@@ -530,10 +531,10 @@ class Amiga:
                 first[r] = v
         out['first'] = first
         ptr = {}
-        for i in range(3):
+        for i in range(4):
             ptr[i] = (first.get(0xE0 + 4 * i, 0) << 16) | first.get(0xE2 + 4 * i, 0)
         out['ptr'] = ptr
-        pal = {i: 0 for i in range(8)}
+        pal = {i: 0 for i in range(16)}
         evs = sorted(ev, key=lambda e: e[0])
         pending = list(evs)
         pal_by_line, bplcon1_by_line = {}, {}
@@ -566,11 +567,11 @@ class Amiga:
         for y in range(y0, y1):
             k = y - y0
             sc = bplcon1_by_line[y]
-            shifts = (sc & 15, (sc >> 4) & 15, sc & 15)
+            shifts = (sc & 15, (sc >> 4) & 15, sc & 15, (sc >> 4) & 15)
             rowpix = []
             for x in range(320):
                 v = 0
-                for p in range(3):
+                for p in range(4):
                     f = hidden + x - shifts[p]
                     if f >= 0:
                         byte = mem.r8(ptr[p] + k * pitch + (f >> 3))
@@ -581,7 +582,7 @@ class Amiga:
             img.append([pal_l[v] for v in rowpix])
         out['px'] = planes_px
         out['img'] = img
-        out['planes'] = [mem.r_block(ptr[p] + 2, 10240) for p in range(3)]
+        out['planes'] = [mem.r_block(ptr[p] + 2, 10240) for p in range(4)]
         out['pal_by_line'] = pal_by_line
         out['bplcon1_by_line'] = bplcon1_by_line
         return out
@@ -721,7 +722,9 @@ def main():
     exe = tmp / 'neon_vectors_sym'
     assemble(exe)
     mod = (ROOT / 'assets/neon.mod').read_bytes()
-    logo = (ROOT / 'assets/logo.raw').read_bytes()
+    logo_all = (ROOT / 'assets/logo.raw').read_bytes()
+    logo_planes = [logo_all[i * 2560:(i + 1) * 2560] for i in range(4)]
+    logo = logo_planes[0]
     font = (ROOT / 'assets/font.raw').read_bytes()
 
     a = Amiga(exe, args.loader_chip, args.alloc_fast)
@@ -743,6 +746,7 @@ def main():
             a.we = [(eb[i], eb[i + 1]) for i in range(0, len(eb), 2)]
         pix, _ = ref_wire(n - 2, a.wv, a.we, (eq['WIRE_D'], eq['WIRE_ZOFF'], eq['MID_CX'], eq['MID_CY'], eq['WIRE_SWAY'], eq['WIRE_ZOOM']))
         want = bytearray(10240)
+        want[eq['LOGO_Y'] * 40:(eq['LOGO_Y'] + eq['LOGO_H']) * 40] = a.logo_p1
         for x, y in pix:
             if 0 <= x < 320 and 0 <= y < 256:
                 want[y * 40 + (x >> 3)] |= 0x80 >> (x & 7)
@@ -752,6 +756,7 @@ def main():
             bad = [i // 40 for i in range(10240) if got[i] != want[i]]
             wire_fail.append('frame %d: displayed wireframe buffer differs from the reference in %d bytes (rows %s...)' % (n, len(bad), sorted(set(bad))[:6]))
     a.ready_verts = False
+    a.logo_p1 = logo_planes[1]
     a.frame_hook = wire_each_frame
     print('running %d frames ...' % args.frames)
     ok = a.run(args.frames, snap_frame)
@@ -902,16 +907,18 @@ def main():
     check(sn['ddf'][:4] == (0x30, 0xD0, 21, -2), 'display fetch setup (DDFSTRT, DDFSTOP, words, modulo) is %s' % (sn['ddf'][:4],))
     check(sn['ptr'][0] == scr - 2, 'plane 0 pointer $%X != $%X (planes start one word early)' % (sn['ptr'][0], scr - 2))
     check(sn['ptr'][2] == scr + 3 * P - 2, 'plane 2 pointer $%X != $%X' % (sn['ptr'][2], scr + 3 * P - 2))
-    check(sn['ptr'][1] in (scr + P - 2, scr + 2 * P - 2), 'plane 1 pointer $%X is not one of the two wireframe buffers' % sn['ptr'][1])
+    check(sn['ptr'][1] in (scr + P - 2, scr + 2 * P - 2), 'plane 1 pointer $%X is not one of the two plane 1 buffers' % sn['ptr'][1])
+    check(sn['ptr'][3] - sn['ptr'][1] == 3 * P, 'plane 3 front buffer $%X does not match the plane 1 front buffer $%X' % (sn['ptr'][3], sn['ptr'][1]))
     n = snap_frame
     equ = lambda name: a.consts[name]
     # ---- expected planes
-    e0, e1, e2 = bytearray(P), bytearray(P), bytearray(P)
+    e0, e1, e2, e3 = bytearray(P), bytearray(P), bytearray(P), bytearray(P)
     def setpix(plane, x, y):
         plane[y * 40 + (x >> 3)] |= 0x80 >> (x & 7)
     LOGO_Y, LOGO_H, MID_Y0, MID_H = equ('LOGO_Y'), equ('LOGO_H'), equ('MID_Y0'), equ('MID_H')
     SCROLL_Y = equ('SCROLL_Y')
-    e0[LOGO_Y * 40:(LOGO_Y + LOGO_H) * 40] = logo
+    for e_, lp in zip((e0, e1, e2, e3), logo_planes):
+        e_[LOGO_Y * 40:(LOGO_Y + LOGO_H) * 40] = lp
     stars = ref_stars(n - 1, equ('NSTARS'), (equ('ZMIN'), equ('ZRANGE'), equ('ZSPEED'), equ('ZMID'), equ('ZNEAR'),
                                               equ('PROJ_F'), equ('MID_CX'), equ('MID_CY'), MID_Y0, MID_H))
     for x, y, cl in stars:
@@ -950,14 +957,19 @@ def main():
         check(False, m_)
     ok0 = diff('plane 0 (logo + mid stars + scroller)', sn['planes'][0], e0)
     ok2 = diff('plane 2 (far + near stars)', sn['planes'][2], e2)
-    ok1 = diff('plane 1 (wireframe, displayed buffer)', sn['planes'][1], e1) if wire_ok else True
+    ok1 = diff('plane 1 (logo + wireframe, displayed buffer)', sn['planes'][1], e1) if wire_ok else True
+    ok3 = diff('plane 3 (logo, displayed buffer)', sn['planes'][3], e3)
     # ---- palette / Copper
     pbl = sn['pal_by_line']
-    check(pbl[44 + 8][1] == 0xFFF, 'logo top colour $%03X, expected white' % pbl[44 + 8][1])
+    import logo_art
+    check(all(pbl[44 + 2][k] == logo_art.PALETTE[k] for k in (1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)),
+          'the logo palette is not loaded by the Copper header')
+    check(pbl[44 + 8][4] == 0xFFF, 'logo face colour at its top row is $%03X, expected white' % pbl[44 + 8][4])
+    check(pbl[44 + 50][4] != pbl[44 + 8][4], 'the logo face colour has no vertical gradient')
+    check(all(pbl[44 + 100][k] == gen_tables.MID_PALETTE[k] for k in range(1, 16)), 'the middle band palette is not loaded below the logo')
     check(pbl[44 + 100][1] == 0xAAD, 'middle band mid-star colour is $%03X, expected $AAD' % pbl[44 + 100][1])
     check(all(pbl[44 + 100][i] == 0x3FC for i in (2, 3, 6, 7)), 'wireframe colours (2, 3, 6, 7) differ')
     # ---- wavy logo: BPLCON1 per row, and the logo as actually displayed
-    import gen_tables
     px = sn['px']
     f = n - 1                                          # frame_no after n-1 completed iterations
     sine = [int(round(127 * math.sin(2 * math.pi * i / 256))) for i in range(256)]
@@ -969,8 +981,8 @@ def main():
         if got_sc != want_sc:
             wave_bad.append((r, got_sc, want_sc))
         for x in range(v, 320):                        # (the first v pixels show the previous row's tail)
-            want_bit = (logo[r * 40 + ((x - v) >> 3)] >> (7 - ((x - v) & 7))) & 1
-            if (px[LOGO_Y + r][x] & 1) != want_bit:
+            want_idx = sum(((logo_planes[k][r * 40 + ((x - v) >> 3)] >> (7 - ((x - v) & 7))) & 1) << k for k in range(4))
+            if px[LOGO_Y + r][x] != want_idx:
                 shown_bad += 1
     check(not wave_bad, 'wavy logo: BPLCON1 differs on %d rows, first (row, got, want) %s' % (len(wave_bad), wave_bad[:2]))
     check(shown_bad == 0, 'the displayed logo differs from the logo shifted by BPLCON1 in %d pixels (fetch/modulo model)' % shown_bad)
@@ -992,7 +1004,7 @@ def main():
            0xB4C,0xA3B,0x92A,0x819,0x708,0x607,0x506,0x405,0x304,0x203,0x102,0x213,0x324,0x435,0x546,0x657]
     check(pbl[44 + 73][0] in pal, 'raster slot colour $%03X is not from the colour table' % pbl[44 + 73][0])
     print('  wireframe buffer verified on each of %d frames' % wire_frames[0])
-    if ok0 and ok1 and ok2 and not wire_fail:
+    if ok0 and ok1 and ok2 and ok3 and not wire_fail:
         print('  logo, %d stars, scroller and the %d-edge wireframe (%d pixels) match the reference models exactly'
               % (len(stars), len(edges), len(pix) if wire_ok else 0))
     if args.png:
