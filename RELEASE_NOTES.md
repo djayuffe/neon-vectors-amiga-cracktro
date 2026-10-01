@@ -1,5 +1,29 @@
 # Release notes
 
+## Effects revision
+
+- **Wavy logo:** each logo row has its own `BPLCON1` scroll move in the Copper list, rewritten every
+  frame from a sine table. Hardware scroll needs one extra fetch word per line, so the display now uses
+  `DDFSTRT` $30, planes that start two bytes early and a modulo of −2.
+- **Copper bars:** four raster bars (magenta, cyan, gold, green) glide at different speeds in the
+  floor below the scroller; the floor rows are repainted every frame.
+- **Gradients per row:** the logo colours now change on every row instead of every second row.
+- **Motion path:** the wireframe sways ±64 pixels left and right and breathes in and out as it rotates.
+- **Logic:** the music tick now runs after the time-critical drawing, the wave uses a lookup table
+  instead of a multiply per row, and the starfield was trimmed to 56 stars, so every single-buffered
+  part still finishes before the beam reaches it (margins: logo rows ~19 000 cycles, stars ~18 000,
+  scroller ~64 000) with the worst frame at 59 % of the CPU budget.
+- **Validator:** a Copper MOVE of `$FFFE` (the new `BPLxMOD`) is no longer mistaken for a WAIT, and
+  MOVEs must target a custom register.
+- **Tests:** the emulation harness's display model now covers the fetch window, modulo and per-row
+  `BPLCON1`; new reference checks cover the wave rows, the displayed logo, the bar rows and the
+  wireframe motion path; and the new deadline for the wave/bar rows. `make emu-mutants` grew from
+  14 to 19 faults (all caught); `make mutants` stays 33/33.
+
+Status: host checks, both mutation self-tests and the emulated-CPU test pass, and the program runs and
+exits cleanly in FS-UAE (A500, AROS ROM) with the new effects visible. Not verified with a genuine
+Kickstart ROM or on real hardware.
+
 ## Graphics revision — UBER CRACKING SERVICE
 
 - **Branding:** the logo is now `UBER` over `CRACKING SERVICE`, and the scroller opens with

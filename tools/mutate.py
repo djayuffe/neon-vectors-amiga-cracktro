@@ -59,7 +59,7 @@ results.append(M_('undefined local label', 'src/main.s',
 results.append(M_('copper end marker lost', 'src/main.s',
     'dc.w $FFFF,$FFFE', 'dc.w $8001,$FFFE', 'end with'))
 results.append(M_('WAIT position bit 0 cleared', 'src/main.s',
-    'dc.w $8801,$FFFE', 'dc.w $8800,$FFFE', 'bit 0 set'))
+    'dc.w $8801,$FFFE', 'dc.w $8800,$FFFE', 'custom register range'))
 results.append(M_('duplicate global label', 'src/main.s',
     'ClearScreen:', 'ClearScreen:\nClearScreen:', 'duplicate global label'))
 results.append(M_('chipdata label used from code', 'src/main.s',

@@ -210,7 +210,7 @@ for rel,n,scope,tok,code in refs:
 # --- data_c payload is only ever reached through the relocation table -------
 # A direct code reference to a chipdata label would bake in a link time address
 # and survive the copy into chip RAM, so only the reloc table may name them.
-chip_labels=['screen','logo_data','font_data','audio_silence','mod_data','copper','cop_bpl1','cop_raster_color']
+chip_labels=['screen','logo_data','font_data','audio_silence','mod_data','copper','cop_bpl1','cop_raster_color','cop_wave','cop_bars']
 for label in chip_labels:
     for n,line in enumerate(main_src.splitlines(),1):
         code=line.split(';',1)[0]
@@ -248,11 +248,12 @@ check(len(cop_words)>=2 and cop_words[-2:]==[0xFFFF,0xFFFE],f'Copper list does n
 check(len(cop_words)%2==0,f'Copper list has an odd number of words ({len(cop_words)})')
 for i in range(0,len(cop_words)-1,2):
     reg,val=cop_words[i],cop_words[i+1]
-    if val==0xFFFE:                                   # WAIT position, mask
-        check(reg&1==1,f'Copper WAIT position word ${reg:04X} must have bit 0 set')
-    else:                                             # MOVE reg, value
+    if reg&1:                                         # WAIT/SKIP: first word has bit 0 set
+        check(val&1==0,f'Copper WAIT ${reg:04X} mask word ${val:04X} must have bit 0 clear')
+    else:                                             # MOVE reg, value (a value of $FFFE is legal)
         check(0<=val<=0xFFFF,f'Copper MOVE to ${reg:04X} has out of range value {val}')
-for reg,val in ((0x08E,0x2C81),(0x090,0x2CC1),(0x092,0x0038),(0x094,0x00D0),(0x100,0x3200)):
+        check(reg>=0x20 and reg<=0x1FE,f'Copper MOVE to ${reg:04X} is outside the custom register range')
+for reg,val in ((0x08E,0x2C81),(0x090,0x2CC1),(0x092,0x0030),(0x094,0x00D0),(0x100,0x3200),(0x108,0xFFFE),(0x10A,0xFFFE)):
     pairs=[(cop_words[i],cop_words[i+1]) for i in range(0,len(cop_words)-1,2)]
     check((reg,val) in pairs,f'Copper list missing standard value ${reg:03X}=${val:04X}')
 check(any(cop_words[i]==0x180 for i in range(0,len(cop_words),2)),'Copper list never sets COLOR00')

@@ -19,8 +19,11 @@ MID_CY          EQU 136
 SCROLL_Y        EQU 200     ; 16 line scroller strip
 SCROLL_H        EQU 16
 
+FLOOR_H         EQU 34      ; copper-bar floor rows (222..255)
+NBARS           EQU 4
+
 ; Starfield: NSTARS points with (x, y, z); z runs from ZMAX down to ZMIN and wraps.
-NSTARS          EQU 64
+NSTARS          EQU 56
 STAR_SIZE       EQU 10      ; x.w y.w z.w offset.w mask.b class.b
 ZMIN            EQU 32
 ZRANGE          EQU 224
@@ -32,6 +35,8 @@ PROJ_F          EQU 128     ; star projection scale
 ; Wireframe: 7-bit sine table, perspective D/(z+ZOFF).
 WIRE_D          EQU 220
 WIRE_ZOFF       EQU 300
+WIRE_SWAY       EQU 64      ; sideways swing, pixels
+WIRE_ZOOM       EQU 18      ; breathing, distance units
 
 ; Runtime pointer slots. AllocChipMem copies the whole data_c block into chip
 ; RAM and rewrites every one of these long words to point into the copy, so no
@@ -44,6 +49,8 @@ ptr_mod      equ reloc_table+16
 ptr_copper   equ reloc_table+20
 ptr_cop_bpl1 equ reloc_table+24
 ptr_raster   equ reloc_table+28
+ptr_wave     equ reloc_table+32
+ptr_bars     equ reloc_table+36
 
         section code,code
         xdef    _start
@@ -123,10 +130,13 @@ _start:
         bsr     WaitFrameSync
         bsr     BlitWait                   ; last frame's wireframe blits must be finished
         bsr     WireSwap                   ; show the buffer drawn last frame
-        bsr     MOD_Tick
+        addq.w  #1,frame_no
+        bsr     UpdateWave                 ; Copper rows above the beam first
+        bsr     UpdateBars
         bsr     UpdateRaster
         bsr     UpdateStars
         bsr     UpdateScroller
+        bsr     MOD_Tick                   ; (timing-critical drawing first: the tick may wait on the blitter-free Paula setup)
         bsr     DrawWire                   ; draw the next frame into the hidden buffer
         btst    #6,CIAAPRA                 ; left mouse button, active low
         bne     .main
@@ -332,12 +342,14 @@ DrawLogo:
 ; Rewrite the three bitplane pointer pairs in the copied Copper list. The list is
 ; stored as MOVE pairs, so the register words sit at byte offsets 0/4/8/12/16/20
 ; and the data words that PatchCopper overwrites at 2/6, 10/14 and 18/22.
-; The screen block holds plane 0, wireframe buffer 0, wireframe buffer 1 and
+; The Copper plane pointers are 2 bytes before the plane (the extra fetch word). The
+; screen block holds plane 0, wireframe buffer 0, wireframe buffer 1 and
 ; plane 2, in that order; plane 1 of the display is whichever wireframe buffer is
 ; currently in front.
 PatchCopper:
         move.l  ptr_cop_bpl1,a1
         move.l  ptr_screen,d3
+        subq.l  #2,d3                      ; every plane starts one word early: BPLCON1 scroll fetches it
         move.l  d3,d0
         move.w  d0,6(a1)                   ; BPL1PTL
         swap    d0
@@ -361,6 +373,80 @@ PatchCopper:
 WireSwap:
         eori.w  #1,wire_front
         bsr     PatchCopper
+        rts
+
+; ---------------------------------------------------------------------------
+; Wavy logo. Every logo row has its own BPLCON1 move in the Copper list (cop_wave,
+; 16 bytes per row, value at +14). Each frame the 64 values are rewritten as a sine of
+; the row and the frame count (table wave_tab: 2..14 pixels of horizontal scroll, the
+; same nibble for both playfields). Rows start at the Copper's WAIT, so this must finish before the
+; beam reaches the logo; it runs first in the frame.
+; ---------------------------------------------------------------------------
+UpdateWave:
+        move.l  ptr_wave,a1
+        lea     wave_tab,a2
+        move.w  frame_no,d3
+        lsl.w   #2,d3                      ; time: 4 table steps per frame
+        moveq   #0,d4                      ; row phase: 3 steps per row (~85 rows per wave)
+        moveq   #LOGO_H-1,d7
+.w:
+        move.w  d3,d0
+        add.w   d4,d0
+        andi.w  #255,d0
+        add.w   d0,d0
+        move.w  0(a2,d0.w),14(a1)          ; BPLCON1 value for this row
+        lea     16(a1),a1
+        addq.w  #3,d4
+        dbra    d7,.w
+        rts
+
+; ---------------------------------------------------------------------------
+; Copper-bar floor. The 34 floor rows (cop_bars, 8 bytes per row, COLOR00 value at +6)
+; are first reset to the static ramp, then NBARS bars of 8 rows are painted over them,
+; each moving on its own sine; later bars are in front.
+; ---------------------------------------------------------------------------
+UpdateBars:
+        move.l  ptr_bars,a1
+        lea     floor_base,a2
+        move.l  a1,a3
+        moveq   #FLOOR_H-1,d7
+.base:
+        move.w  (a2)+,6(a3)
+        lea     8(a3),a3
+        dbra    d7,.base
+        lea     sintab,a2
+        lea     bar_colors,a3
+        moveq   #0,d6
+.bar:
+        move.w  frame_no,d0
+        move.w  d6,d1
+        addq.w  #2,d1
+        mulu    d1,d0                      ; frame * (bar + 2): each bar has its own speed
+        move.w  d6,d1
+        lsl.w   #6,d1
+        add.w   d1,d0                      ; + 64 steps of phase per bar
+        andi.w  #255,d0
+        add.w   d0,d0
+        move.w  0(a2,d0.w),d0
+        muls    #13,d0
+        asr.l   #7,d0
+        addi.w  #FLOOR_H/2-4,d0            ; first of the bar's 8 rows
+        moveq   #8-1,d7
+.row:
+        tst.w   d0
+        bmi     .skip
+        cmp.w   #FLOOR_H,d0
+        bge     .skip
+        move.w  d0,d1
+        lsl.w   #3,d1
+        move.w  (a3),6(a1,d1.w)
+.skip:
+        addq.l  #2,a3
+        addq.w  #1,d0
+        dbra    d7,.row
+        addq.w  #1,d6
+        cmp.w   #NBARS,d6
+        blo     .bar
         rts
 
 ; ---------------------------------------------------------------------------
@@ -642,6 +728,24 @@ DrawWire:
         addq.w  #1,ang_x
         addq.w  #2,ang_y
         addq.w  #1,ang_z
+; Motion path: the object sways left and right and breathes towards and away from the eye.
+        lea     sintab,a2
+        move.w  ang_x,d0
+        andi.w  #255,d0
+        add.w   d0,d0
+        move.w  0(a2,d0.w),d0
+        muls    #WIRE_SWAY,d0
+        asr.l   #7,d0
+        addi.w  #MID_CX,d0
+        move.w  d0,wire_cx
+        move.w  ang_y,d0
+        andi.w  #255,d0
+        add.w   d0,d0
+        move.w  0(a2,d0.w),d0
+        muls    #WIRE_ZOOM,d0
+        asr.l   #7,d0
+        addi.w  #WIRE_ZOFF,d0
+        move.w  d0,wire_zoff
         lea     proj,a3
 ; Cube: angles (x, y, z).
         move.w  ang_x,d0
@@ -830,12 +934,12 @@ TransformVerts:
         muls    16(a2),d6
         add.l   d6,d5
         asr.l   #7,d5                      ; rotated z
-        addi.w  #WIRE_ZOFF,d5              ; distance from the eye
+        add.w   wire_zoff,d5               ; distance from the eye
         add.w   d5,d5
         move.w  0(a4,d5.w),d5              ; WIRE_D * 256 / distance
         muls    d5,d3
         asr.l   #8,d3
-        addi.w  #MID_CX,d3
+        add.w   wire_cx,d3
         muls    d5,d4
         asr.l   #8,d4
         addi.w  #MID_CY,d4
@@ -933,6 +1037,9 @@ gfx_base:    dc.l 0
 chip_base:   dc.l 0
 scroll_ptr:  dc.l scroll_text
 rng_seed:    dc.w 1
+frame_no:    dc.w 0
+wire_cx:     dc.w MID_CX
+wire_zoff:   dc.w WIRE_ZOFF
 wire_front:  dc.w 0             ; index of the wireframe buffer being displayed
 ang_x:       dc.w 0
 ang_y:       dc.w 0
@@ -947,12 +1054,13 @@ mat:         ds.w 9             ; 3x3 rotation matrix, scaled by 128
 proj:        ds.w 14*2          ; projected (x, y) of the 14 wireframe vertices
 stars:       ds.b NSTARS*STAR_SIZE
 
-; The eight DMA visible labels as link-time addresses. AllocChipMem rewrites
+; The ten DMA visible labels as link-time addresses. AllocChipMem rewrites
 ; every long word in place, so ptr_* slots hold runtime chip RAM addresses.
         even
 reloc_table:
         dc.l screen,logo_data,font_data,audio_silence,mod_data,copper,cop_bpl1,cop_raster_color
-RELOC_COUNT     EQU 8
+        dc.l cop_wave,cop_bars
+RELOC_COUNT     EQU 10
 
 gfx_name:    dc.b "graphics.library",0
         even
@@ -987,6 +1095,36 @@ edges:
         dc.b 9,10, 9,11, 9,12, 9,13
         dc.b 10,12, 10,13, 11,12, 11,13
 edges_end:
+
+; Wavy logo values (tools/gen_tables.py wave_tab).
+wave_tab:
+        dc.w $088,$088,$088,$088,$088,$088,$088,$099,$099,$099,$099,$099,$099,$099,$0AA,$0AA
+        dc.w $0AA,$0AA,$0AA,$0AA,$0AA,$0AA,$0BB,$0BB,$0BB,$0BB,$0BB,$0BB,$0BB,$0BB,$0BB,$0CC
+        dc.w $0CC,$0CC,$0CC,$0CC,$0CC,$0CC,$0CC,$0CC,$0CC,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD
+        dc.w $0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD
+        dc.w $0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD
+        dc.w $0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0DD,$0CC,$0CC,$0CC,$0CC,$0CC,$0CC,$0CC,$0CC
+        dc.w $0CC,$0CC,$0BB,$0BB,$0BB,$0BB,$0BB,$0BB,$0BB,$0BB,$0BB,$0AA,$0AA,$0AA,$0AA,$0AA
+        dc.w $0AA,$0AA,$0AA,$099,$099,$099,$099,$099,$099,$099,$088,$088,$088,$088,$088,$088
+        dc.w $088,$077,$077,$077,$077,$077,$077,$066,$066,$066,$066,$066,$066,$066,$055,$055
+        dc.w $055,$055,$055,$055,$055,$055,$044,$044,$044,$044,$044,$044,$044,$044,$044,$033
+        dc.w $033,$033,$033,$033,$033,$033,$033,$033,$033,$022,$022,$022,$022,$022,$022,$022
+        dc.w $022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022
+        dc.w $022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022,$022
+        dc.w $022,$022,$022,$022,$022,$022,$022,$022,$033,$033,$033,$033,$033,$033,$033,$033
+        dc.w $033,$033,$044,$044,$044,$044,$044,$044,$044,$044,$044,$055,$055,$055,$055,$055
+        dc.w $055,$055,$055,$066,$066,$066,$066,$066,$066,$066,$077,$077,$077,$077,$077,$077
+
+; Copper-bar floor: the static ramp and the 4 bars x 8 rows of colour (tools/gen_tables.py).
+floor_base:
+        dc.w $102,$102,$102,$102,$102,$102,$202,$202,$202,$213,$213,$213,$213,$213,$213,$213
+        dc.w $213,$313,$313,$313,$313,$313,$313,$313,$313,$324,$324,$324,$424,$424,$424,$424
+        dc.w $424,$424
+bar_colors:
+        dc.w $414,$826,$B29,$F3C,$F3C,$B29,$826,$414
+        dc.w $134,$268,$2AC,$3DF,$3DF,$2AC,$268,$134
+        dc.w $432,$862,$B92,$FC3,$FC3,$B92,$862,$432
+        dc.w $142,$284,$3B6,$4F7,$4F7,$3B6,$284,$142
 
 ; Reciprocals that replace divisions in the inner loops (tools/gen_tables.py):
 ; recip_star[z] = round(PROJ_F*256/z), recip_wire[zc] = round(WIRE_D*256/zc), so
@@ -1072,9 +1210,9 @@ sintab:
 chipdata_begin:
 copper:
         dc.w DIWSTRT,$2C81,DIWSTOP,$2CC1
-        dc.w DDFSTRT,$0038,DDFSTOP,$00D0
+        dc.w DDFSTRT,$0030,DDFSTOP,$00D0   ; one extra word per line (BPLCON1 scroll), see BPLxMOD
         dc.w BPLCON0,$3200,BPLCON1,$0000,BPLCON2,$0000
-        dc.w BPL1MOD,$0000,BPL2MOD,$0000
+        dc.w BPL1MOD,$FFFE,BPL2MOD,$FFFE   ; 21 words fetched, 20 words per line: step back 2 bytes
 cop_bpl1:
         dc.w BPL1PTH,0,BPL1PTL,0
         dc.w BPL2PTH,0,BPL2PTL,0
@@ -1085,41 +1223,75 @@ cop_bpl1:
 ; the text colour in the logo and scroller bands and the mid-distance star colour
 ; in the middle band; COLOR02/03/06/07 are the wireframe colour (plane 1), so the
 ; wireframe stays in front of any star drawn behind it.
-        dc.w $3401,$FFFE,COLOR00,$0002,COLOR01,$0FFF
-        dc.w $3601,$FFFE,COLOR00,$0002,COLOR01,$0FFE
-        dc.w $3801,$FFFE,COLOR00,$0002,COLOR01,$0FFE
-        dc.w $3A01,$FFFE,COLOR00,$0002,COLOR01,$0FFD
-        dc.w $3C01,$FFFE,COLOR00,$0002,COLOR01,$0FFD
-        dc.w $3E01,$FFFE,COLOR00,$0002,COLOR01,$0FFC
-        dc.w $4001,$FFFE,COLOR00,$0002,COLOR01,$0FFC
-        dc.w $4201,$FFFE,COLOR00,$0002,COLOR01,$0FFB
-        dc.w $4401,$FFFE,COLOR00,$0103,COLOR01,$0FFB
-        dc.w $4601,$FFFE,COLOR00,$0103,COLOR01,$0FFA
-        dc.w $4801,$FFFE,COLOR00,$0103,COLOR01,$0FF9
-        dc.w $4A01,$FFFE,COLOR00,$0103,COLOR01,$0FF9
-        dc.w $4C01,$FFFE,COLOR00,$0103,COLOR01,$0FE8
-        dc.w $4E01,$FFFE,COLOR00,$0103,COLOR01,$0FE8
-        dc.w $5001,$FFFE,COLOR00,$0103,COLOR01,$0FD7
-        dc.w $5201,$FFFE,COLOR00,$0103,COLOR01,$0FD6
-        dc.w $5401,$FFFE,COLOR00,$0113,COLOR01,$0FC6
-        dc.w $5601,$FFFE,COLOR00,$0113,COLOR01,$0FC5
-        dc.w $5801,$FFFE,COLOR00,$0113,COLOR01,$0FB4
-        dc.w $5A01,$FFFE,COLOR00,$0113,COLOR01,$0FB4
-        dc.w $5C01,$FFFE,COLOR00,$0113,COLOR01,$0FA4
-        dc.w $5E01,$FFFE,COLOR00,$0113,COLOR01,$0FA4
-        dc.w $6001,$FFFE,COLOR00,$0113,COLOR01,$0F93
-        dc.w $6201,$FFFE,COLOR00,$0113,COLOR01,$0F93
-        dc.w $6401,$FFFE,COLOR00,$0214,COLOR01,$0F83
-        dc.w $6601,$FFFE,COLOR00,$0214,COLOR01,$0E83
-        dc.w $6801,$FFFE,COLOR00,$0214,COLOR01,$0E73
-        dc.w $6A01,$FFFE,COLOR00,$0214,COLOR01,$0E73
-        dc.w $6C01,$FFFE,COLOR00,$0214,COLOR01,$0E62
-        dc.w $6E01,$FFFE,COLOR00,$0214,COLOR01,$0E62
-        dc.w $7001,$FFFE,COLOR00,$0214,COLOR01,$0E52
-        dc.w $7201,$FFFE,COLOR00,$0214,COLOR01,$0E52
-        dc.w $7401,$FFFE                    ; y=72: animated slot
+cop_wave:                                   ; 64 rows, 16 bytes each (BPLCON1 value at +14)
+        dc.w $3401,$FFFE,COLOR00,$0002,COLOR01,$0FFF,BPLCON1,$0088
+        dc.w $3501,$FFFE,COLOR00,$0002,COLOR01,$0FFF,BPLCON1,$0088
+        dc.w $3601,$FFFE,COLOR00,$0002,COLOR01,$0FFE,BPLCON1,$0088
+        dc.w $3701,$FFFE,COLOR00,$0002,COLOR01,$0FFE,BPLCON1,$0088
+        dc.w $3801,$FFFE,COLOR00,$0002,COLOR01,$0FFE,BPLCON1,$0088
+        dc.w $3901,$FFFE,COLOR00,$0002,COLOR01,$0FFE,BPLCON1,$0088
+        dc.w $3A01,$FFFE,COLOR00,$0002,COLOR01,$0FFD,BPLCON1,$0088
+        dc.w $3B01,$FFFE,COLOR00,$0002,COLOR01,$0FFD,BPLCON1,$0088
+        dc.w $3C01,$FFFE,COLOR00,$0002,COLOR01,$0FFD,BPLCON1,$0088
+        dc.w $3D01,$FFFE,COLOR00,$0002,COLOR01,$0FFD,BPLCON1,$0088
+        dc.w $3E01,$FFFE,COLOR00,$0002,COLOR01,$0FFC,BPLCON1,$0088
+        dc.w $3F01,$FFFE,COLOR00,$0002,COLOR01,$0FFC,BPLCON1,$0088
+        dc.w $4001,$FFFE,COLOR00,$0002,COLOR01,$0FFC,BPLCON1,$0088
+        dc.w $4101,$FFFE,COLOR00,$0002,COLOR01,$0FFB,BPLCON1,$0088
+        dc.w $4201,$FFFE,COLOR00,$0002,COLOR01,$0FFB,BPLCON1,$0088
+        dc.w $4301,$FFFE,COLOR00,$0002,COLOR01,$0FFB,BPLCON1,$0088
+        dc.w $4401,$FFFE,COLOR00,$0103,COLOR01,$0FFB,BPLCON1,$0088
+        dc.w $4501,$FFFE,COLOR00,$0103,COLOR01,$0FFA,BPLCON1,$0088
+        dc.w $4601,$FFFE,COLOR00,$0103,COLOR01,$0FFA,BPLCON1,$0088
+        dc.w $4701,$FFFE,COLOR00,$0103,COLOR01,$0FFA,BPLCON1,$0088
+        dc.w $4801,$FFFE,COLOR00,$0103,COLOR01,$0FFA,BPLCON1,$0088
+        dc.w $4901,$FFFE,COLOR00,$0103,COLOR01,$0FF9,BPLCON1,$0088
+        dc.w $4A01,$FFFE,COLOR00,$0103,COLOR01,$0FF9,BPLCON1,$0088
+        dc.w $4B01,$FFFE,COLOR00,$0103,COLOR01,$0FF9,BPLCON1,$0088
+        dc.w $4C01,$FFFE,COLOR00,$0103,COLOR01,$0FF8,BPLCON1,$0088
+        dc.w $4D01,$FFFE,COLOR00,$0103,COLOR01,$0FE8,BPLCON1,$0088
+        dc.w $4E01,$FFFE,COLOR00,$0103,COLOR01,$0FE8,BPLCON1,$0088
+        dc.w $4F01,$FFFE,COLOR00,$0103,COLOR01,$0FE7,BPLCON1,$0088
+        dc.w $5001,$FFFE,COLOR00,$0103,COLOR01,$0FD7,BPLCON1,$0088
+        dc.w $5101,$FFFE,COLOR00,$0103,COLOR01,$0FD7,BPLCON1,$0088
+        dc.w $5201,$FFFE,COLOR00,$0103,COLOR01,$0FD6,BPLCON1,$0088
+        dc.w $5301,$FFFE,COLOR00,$0103,COLOR01,$0FD6,BPLCON1,$0088
+        dc.w $5401,$FFFE,COLOR00,$0113,COLOR01,$0FC6,BPLCON1,$0088
+        dc.w $5501,$FFFE,COLOR00,$0113,COLOR01,$0FC6,BPLCON1,$0088
+        dc.w $5601,$FFFE,COLOR00,$0113,COLOR01,$0FC5,BPLCON1,$0088
+        dc.w $5701,$FFFE,COLOR00,$0113,COLOR01,$0FC5,BPLCON1,$0088
+        dc.w $5801,$FFFE,COLOR00,$0113,COLOR01,$0FB5,BPLCON1,$0088
+        dc.w $5901,$FFFE,COLOR00,$0113,COLOR01,$0FB4,BPLCON1,$0088
+        dc.w $5A01,$FFFE,COLOR00,$0113,COLOR01,$0FB4,BPLCON1,$0088
+        dc.w $5B01,$FFFE,COLOR00,$0113,COLOR01,$0FB4,BPLCON1,$0088
+        dc.w $5C01,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
+        dc.w $5D01,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
+        dc.w $5E01,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
+        dc.w $5F01,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
+        dc.w $6001,$FFFE,COLOR00,$0113,COLOR01,$0FA4,BPLCON1,$0088
+        dc.w $6101,$FFFE,COLOR00,$0113,COLOR01,$0F93,BPLCON1,$0088
+        dc.w $6201,$FFFE,COLOR00,$0113,COLOR01,$0F93,BPLCON1,$0088
+        dc.w $6301,$FFFE,COLOR00,$0113,COLOR01,$0F93,BPLCON1,$0088
+        dc.w $6401,$FFFE,COLOR00,$0214,COLOR01,$0F93,BPLCON1,$0088
+        dc.w $6501,$FFFE,COLOR00,$0214,COLOR01,$0F83,BPLCON1,$0088
+        dc.w $6601,$FFFE,COLOR00,$0214,COLOR01,$0F83,BPLCON1,$0088
+        dc.w $6701,$FFFE,COLOR00,$0214,COLOR01,$0E83,BPLCON1,$0088
+        dc.w $6801,$FFFE,COLOR00,$0214,COLOR01,$0E83,BPLCON1,$0088
+        dc.w $6901,$FFFE,COLOR00,$0214,COLOR01,$0E73,BPLCON1,$0088
+        dc.w $6A01,$FFFE,COLOR00,$0214,COLOR01,$0E73,BPLCON1,$0088
+        dc.w $6B01,$FFFE,COLOR00,$0214,COLOR01,$0E73,BPLCON1,$0088
+        dc.w $6C01,$FFFE,COLOR00,$0214,COLOR01,$0E73,BPLCON1,$0088
+        dc.w $6D01,$FFFE,COLOR00,$0214,COLOR01,$0E62,BPLCON1,$0088
+        dc.w $6E01,$FFFE,COLOR00,$0214,COLOR01,$0E62,BPLCON1,$0088
+        dc.w $6F01,$FFFE,COLOR00,$0214,COLOR01,$0E62,BPLCON1,$0088
+        dc.w $7001,$FFFE,COLOR00,$0214,COLOR01,$0E62,BPLCON1,$0088
+        dc.w $7101,$FFFE,COLOR00,$0214,COLOR01,$0E52,BPLCON1,$0088
+        dc.w $7201,$FFFE,COLOR00,$0214,COLOR01,$0E52,BPLCON1,$0088
+        dc.w $7301,$FFFE,COLOR00,$0214,COLOR01,$0E52,BPLCON1,$0088
+        dc.w $7401,$FFFE                    ; y=72: animated slot, then the wave ends
 cop_raster_color:
         dc.w COLOR00,$013                   ; animated by UpdateRaster each frame
+        dc.w BPLCON1,$0000
         dc.w $7801,$FFFE,COLOR00,$0001,COLOR01,$0AAD
         dc.w $8001,$FFFE,COLOR00,$0001
         dc.w $8801,$FFFE,COLOR00,$0012
@@ -1149,18 +1321,45 @@ cop_raster_color:
         dc.w $0201,$FFFE,COLOR01,$05BE
         dc.w $0601,$FFFE,COLOR00,$06CF
         dc.w $0701,$FFFE,COLOR00,$0001
+cop_bars:                                   ; 34 rows of WAIT + COLOR00, 8 bytes each (value at +6)
         dc.w $0A01,$FFFE,COLOR00,$0102
-        dc.w $0E01,$FFFE,COLOR00,$0001
-        dc.w $1201,$FFFE,COLOR00,$0214
-        dc.w $1601,$FFFE,COLOR00,$0001
-        dc.w $1A01,$FFFE,COLOR00,$0426
-        dc.w $1E01,$FFFE,COLOR00,$0001
-        dc.w $2201,$FFFE,COLOR00,$0528
-        dc.w $2601,$FFFE,COLOR00,$0001
-        dc.w $2A01,$FFFE,COLOR00,$063A
+        dc.w $0B01,$FFFE,COLOR00,$0102
+        dc.w $0C01,$FFFE,COLOR00,$0102
+        dc.w $0D01,$FFFE,COLOR00,$0102
+        dc.w $0E01,$FFFE,COLOR00,$0102
+        dc.w $0F01,$FFFE,COLOR00,$0102
+        dc.w $1001,$FFFE,COLOR00,$0202
+        dc.w $1101,$FFFE,COLOR00,$0202
+        dc.w $1201,$FFFE,COLOR00,$0202
+        dc.w $1301,$FFFE,COLOR00,$0213
+        dc.w $1401,$FFFE,COLOR00,$0213
+        dc.w $1501,$FFFE,COLOR00,$0213
+        dc.w $1601,$FFFE,COLOR00,$0213
+        dc.w $1701,$FFFE,COLOR00,$0213
+        dc.w $1801,$FFFE,COLOR00,$0213
+        dc.w $1901,$FFFE,COLOR00,$0213
+        dc.w $1A01,$FFFE,COLOR00,$0213
+        dc.w $1B01,$FFFE,COLOR00,$0313
+        dc.w $1C01,$FFFE,COLOR00,$0313
+        dc.w $1D01,$FFFE,COLOR00,$0313
+        dc.w $1E01,$FFFE,COLOR00,$0313
+        dc.w $1F01,$FFFE,COLOR00,$0313
+        dc.w $2001,$FFFE,COLOR00,$0313
+        dc.w $2101,$FFFE,COLOR00,$0313
+        dc.w $2201,$FFFE,COLOR00,$0313
+        dc.w $2301,$FFFE,COLOR00,$0324
+        dc.w $2401,$FFFE,COLOR00,$0324
+        dc.w $2501,$FFFE,COLOR00,$0324
+        dc.w $2601,$FFFE,COLOR00,$0424
+        dc.w $2701,$FFFE,COLOR00,$0424
+        dc.w $2801,$FFFE,COLOR00,$0424
+        dc.w $2901,$FFFE,COLOR00,$0424
+        dc.w $2A01,$FFFE,COLOR00,$0424
+        dc.w $2B01,$FFFE,COLOR00,$0424
         dc.w $FFFF,$FFFE
 
         cnop 0,4
+        dc.l 0                      ; the word fetched left of line 0 (planes start 2 bytes early)
 screen:     ds.b PLANE_SIZE*4   ; plane 0 | wireframe buffer 0 | wireframe buffer 1 | plane 2
 logo_data:  incbin "assets/logo.raw"
 font_data:  incbin "assets/font.raw"

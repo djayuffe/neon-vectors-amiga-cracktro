@@ -10,7 +10,7 @@
 | 68000 assembly | `make` | assembles with VASM 2.0f, no errors |
 | Hunk executable structure | `make` (`hunkcheck.py`) | valid; 3 hunks (code, data, chip data) |
 | Behaviour on an emulated 68000 | `make emutest` | passes (PAL, `--loader-chip`, `--alloc-fast`, `--ntsc`) |
-| Emulation-test self-test | `make emu-mutants` | 14/14 injected faults caught |
+| Emulation-test self-test | `make emu-mutants` | 19/19 injected faults caught |
 | Cycle-exact emulator | FS-UAE, A500 config, AROS ROM | runs, animates, exits cleanly; audio not audited by ear |
 | Genuine Kickstart ROM | FS-UAE / WinUAE / Amiberry | **not run** |
 | Real PAL OCS/ECS machine | — | **not run** |
@@ -48,8 +48,10 @@ chipset emulation. Start from a Shell and run `neon_vectors`, then confirm:
 - [ ] the starfield flies outward from the centre in three brightnesses; no trails or flicker; wireframe stays in front of the stars
 - [ ] scroller moves left smoothly and inserts clean columns; text wraps at the end
 - [ ] all four channels audible; drums retrigger; no persistent buzz after a one-shot; no noise burst at start
-- [ ] the wireframe cube and octahedron rotate smoothly with no half-drawn frames; all edges solid
-- [ ] no visible tearing in the starfield or scroller (per-frame work ≈ 71 k cycles average, 80 k worst, of ≈ 142 k)
+- [ ] the wireframe cube and octahedron rotate and sway smoothly with no half-drawn frames; all edges solid
+- [ ] the logo ripples smoothly with no torn or jumping rows; the four floor bars glide without flicker
+- [ ] no visible tearing in the starfield or scroller (per-frame work ≈ 77 k cycles average, 84 k worst, of ≈ 142 k)
+- [ ] the screen edges are clean: the extra fetch word must not show a stripe at the left edge
 - [ ] left mouse button exits; the previous display returns; the system keeps running
 - [ ] run it repeatedly: memory is returned each time (check `avail`)
 

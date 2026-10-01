@@ -48,11 +48,11 @@ the hunk in ordinary memory, so the program does the work itself:
 1. `AllocMem(d0 = size, d1 = MEMF_CHIP)` for the whole contiguous payload block.
 2. `TypeOfMem(a1 = block)` to confirm chip RAM; otherwise `FreeMem` and fail with code 20.
 3. `CopyMem(a0 = source, a1 = dest, d0 = size)`.
-4. Rewrite each of the eight longwords in `reloc_table` as `base + (assembled − block start)`.
+4. Rewrite each of the ten longwords in `reloc_table` as `base + (assembled − block start)`.
 
-The block holds, in order, the Copper list, four plane-sized screen buffers (plane 0, two
+The block holds, in order, the Copper list, a spare word, four plane-sized screen buffers (plane 0, two
 wireframe buffers, plane 2), logo, font, the `$8080` silence word and the MOD. Code reaches them only through `ptr_screen`, `ptr_logo`, `ptr_font`,
-`ptr_silence`, `ptr_mod`, `ptr_copper`, `ptr_cop_bpl1` and `ptr_raster` (slots in
+`ptr_silence`, `ptr_mod`, `ptr_copper`, `ptr_cop_bpl1`, `ptr_raster`, `ptr_wave` and `ptr_bars` (slots in
 `reloc_table`). A direct reference to one of those labels would keep pointing at the loaded
 hunk, so `tools/validate.py` rejects it, and the emulation test verifies that the original
 hunk is never modified.
@@ -85,33 +85,36 @@ first leaves the sync zone, then waits for line ≥ 300, the first line below th
 50 Hz tick rate on both the 312- and 313-line frames. Each iteration runs, in order:
 
 1. `BlitWait`, then `WireSwap` — show the wireframe buffer that was finished last frame;
-2. `MOD_Tick` — one tracker tick (a row every 6 ticks);
+2. `UpdateWave` and `UpdateBars` — rewrite the logo's `BPLCON1` rows and the floor's colour rows
+   in the Copper list (they must finish before the beam reaches the logo);
 3. `UpdateRaster` — rewrites the animated `COLOR00` slot;
 4. `UpdateStars` — erase, advance and redraw the 3D starfield;
 5. `UpdateScroller` — every second frame, shift the strip one pixel and insert a column;
-6. `DrawWire` — clear the hidden buffer's band with the blitter, rotate and project, draw 24
-   edges with the blitter;
-7. test the left mouse button.
+6. `MOD_Tick` — one tracker tick (a row every 6 ticks), after the time-critical drawing;
+7. `DrawWire` — clear the hidden buffer's band with the blitter, move/rotate/project, draw 24 edges
+   with the blitter;
+8. test the left mouse button.
 
 **Why each thing is (or is not) double-buffered.** The wireframe takes most of a frame to draw,
-so it alone is double-buffered. The stars are drawn first and finish before the beam reaches the
-starfield band; the scroller is shifted before the beam reaches its strip. The loop measures both
-deadlines in `tools/emu_test.py`: the stars finish about 18 000 cycles ahead of the beam and the
-scroller about 68 000, in the worst frame.
+so it alone is double-buffered. The Copper rows for the wave and the bars are rewritten first and
+finish before the beam reaches the logo; the stars finish before the beam reaches the starfield
+band; the scroller is shifted before the beam reaches its strip. `tools/emu_test.py` measures all
+three deadlines: in the worst frame the margins are about 19 000, 18 000 and 64 000 cycles.
 
 **CPU budget** (emulated 68000, no DMA contention, blitter time not included since it runs in
-parallel): about 71 000 cycles per frame on average, 80 000 worst case, i.e. 50–56 % of a 142 000
-cycle frame. The main costs are the starfield (~29 000), the wireframe (~32 000) and the
-scroller (~5 000 averaged over two frames).
+parallel): about 77 000 cycles per frame on average, 84 000 worst case, i.e. 54–59 % of a 142 000
+cycle frame. The main costs are the starfield (~25 000), the wireframe (~32 000), the wave and
+bars (~9 000) and the scroller (~5 000 averaged over two frames).
 
 If the beam wraps before line 300 is reached — a 262-line NTSC frame — the wait ends at the wrap
 instead of hanging with interrupts disabled.
 
 ## Display
 
-- 320×256 low resolution PAL, three bitplanes, 40 bytes per line, zero modulo
+- 320×256 low resolution PAL, three bitplanes, 40 bytes per line; 21 words fetched per line with
+  modulo −2 and planes starting one word early (for the per-row `BPLCON1` scroll)
 - Plane 0: logo, mid stars, scroller; plane 1: wireframe (double-buffered); plane 2: far/near stars
-- Copper-programmed DIW/DDF, bitplane pointers, palette, and ~75 per-line colour changes
+- Copper-programmed DIW/DDF, bitplane pointers, palette, and per-row colour and scroll changes
 
 ## Constraints
 

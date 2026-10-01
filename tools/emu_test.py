@@ -21,7 +21,7 @@ Use an emulator such as FS-UAE/WinUAE/Amiberry for that.
 
 Usage: emu_test.py [--frames N] [--png FILE] [--alloc-fast] [--loader-chip]
 """
-import argparse, os, shutil, struct, subprocess, sys, tempfile, zlib
+import argparse, math, os, shutil, struct, subprocess, sys, tempfile, zlib
 from pathlib import Path
 
 try:
@@ -31,6 +31,7 @@ except ImportError:
     sys.exit(77)
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 LINE_CYCLES = 454                 # 227 colour clocks * 2 CPU cycles at 7.09 MHz
 FRAME_LINES = 312
 FRAME_CYCLES = LINE_CYCLES * FRAME_LINES
@@ -454,7 +455,7 @@ class Amiga:
         self.exit_pc = None
         self.in_wfs = False
         self.exit_times = []
-        self.mark_pcs = {self.sym('UpdateScroller'): 'scroller', self.sym('DrawWire'): 'wire'}
+        self.mark_pcs = {self.sym('UpdateStars'): 'stars', self.sym('UpdateScroller'): 'scroller', self.sym('DrawWire'): 'wire'}
         self.snapshot = None
         steps = 0
         while True:
@@ -533,39 +534,56 @@ class Amiga:
             ptr[i] = (first.get(0xE0 + 4 * i, 0) << 16) | first.get(0xE2 + 4 * i, 0)
         out['ptr'] = ptr
         pal = {i: 0 for i in range(8)}
-        rows = []
         evs = sorted(ev, key=lambda e: e[0])
         pending = list(evs)
-        pal_by_line = {}
-        cur = dict(pal)
+        pal_by_line, bplcon1_by_line = {}, {}
+        cur, scroll = dict(pal), 0
         for y in range(FRAME_LINES):
             while pending and pending[0][0] <= y:
                 _, r, v = pending.pop(0)
                 if 0x180 <= r < 0x1A0:
                     cur[(r - 0x180) // 2] = v
+                elif r == 0x102:
+                    scroll = v
             pal_by_line[y] = dict(cur)
+            bplcon1_by_line[y] = scroll
         diwstrt, diwstop = first.get(0x8E, 0), first.get(0x90, 0)
         y0 = diwstrt >> 8
         y1 = (diwstop >> 8) | 0x100
         out['diw'] = (y0, y1)
+        # Bitplane fetch: (DDFSTOP-DDFSTRT)/8+1 words per line, the first of which is hidden left of
+        # the window when DDFSTRT is earlier than $38 (16 pixels per 8 colour clocks); BPLCON1 delays
+        # the data by its nibble: odd planes (1, 3) use bits 3-0, even planes (2) bits 7-4.
+        ddfstrt, ddfstop = first.get(0x92, 0x38), first.get(0x94, 0xD0)
+        words = (ddfstop - ddfstrt) // 8 + 1
+        hidden = (0x38 - ddfstrt) * 2
+        mod = first.get(0x108, 0)
+        mod = mod - 0x10000 if mod & 0x8000 else mod
+        pitch = words * 2 + mod
+        out['ddf'] = (ddfstrt, ddfstop, words, mod, pitch, hidden)
         img = []
         planes_px = []
         for y in range(y0, y1):
+            k = y - y0
+            sc = bplcon1_by_line[y]
+            shifts = (sc & 15, (sc >> 4) & 15, sc & 15)
             rowpix = []
             for x in range(320):
                 v = 0
                 for p in range(3):
-                    byte = mem.r8(ptr[p] + (y - y0) * 40 + (x >> 3))
-                    v |= ((byte >> (7 - (x & 7))) & 1) << p
+                    f = hidden + x - shifts[p]
+                    if f >= 0:
+                        byte = mem.r8(ptr[p] + k * pitch + (f >> 3))
+                        v |= ((byte >> (7 - (f & 7))) & 1) << p
                 rowpix.append(v)
             planes_px.append(rowpix)
             pal_l = pal_by_line[y]
             img.append([pal_l[v] for v in rowpix])
         out['px'] = planes_px
-        out['planes'] = [mem.r_block(ptr[p], 10240) for p in range(3)]
-        out['pal_by_line'] = pal_by_line
         out['img'] = img
-        out['pal128'] = pal_by_line[0x80][0]
+        out['planes'] = [mem.r_block(ptr[p] + 2, 10240) for p in range(3)]
+        out['pal_by_line'] = pal_by_line
+        out['bplcon1_by_line'] = bplcon1_by_line
         return out
 
     def sample_loop_regs(self):
@@ -646,7 +664,7 @@ def ref_bresenham(x1, y1, x2, y2):
 
 def ref_wire(k, verts, edges, consts):
     import math
-    D, ZOFF, CX, CY = consts
+    D, ZOFF, CX, CY, SWAY, ZOOM = consts
     tab = [int(round(127 * math.sin(2 * math.pi * i / 256))) for i in range(256)]
     sin = lambda a: tab[a & 255]
     cos = lambda a: tab[(a + 64) & 255]
@@ -664,9 +682,11 @@ def ref_wire(k, verts, edges, consts):
         x, y, z = v
         xr = (m[0] * x + m[1] * y + m[2] * z) >> 7
         yr = (m[3] * x + m[4] * y + m[5] * z) >> 7
-        zc = ((m[6] * x + m[7] * y + m[8] * z) >> 7) + ZOFF
+        zc = ((m[6] * x + m[7] * y + m[8] * z) >> 7) + zoff
         r = int(round(D * 256 / zc))
-        return (((xr * r) >> 8) + CX, ((yr * r) >> 8) + CY)
+        return (((xr * r) >> 8) + cx, ((yr * r) >> 8) + CY)
+    cx = CX + ((sin(k) * SWAY) >> 7)              # sways with the x angle,
+    zoff = ZOFF + ((sin(2 * k) * ZOOM) >> 7)      # breathes with the y angle
     ma = matrix(k, 2 * k, k)
     mb = matrix(2 * k, -k, -2 * k)
     proj = [project(ma, v) for v in verts[:8]] + [project(mb, v) for v in verts[8:]]
@@ -721,12 +741,12 @@ def main():
             a.wv = [struct.unpack('>3h', a.mem.r_block(a.sym('verts') + 6 * i, 6)) for i in range(14)]
             eb = a.mem.r_block(a.sym('edges'), a.sym('edges_end') - a.sym('edges'))
             a.we = [(eb[i], eb[i + 1]) for i in range(0, len(eb), 2)]
-        pix, _ = ref_wire(n - 2, a.wv, a.we, (eq['WIRE_D'], eq['WIRE_ZOFF'], eq['MID_CX'], eq['MID_CY']))
+        pix, _ = ref_wire(n - 2, a.wv, a.we, (eq['WIRE_D'], eq['WIRE_ZOFF'], eq['MID_CX'], eq['MID_CY'], eq['WIRE_SWAY'], eq['WIRE_ZOOM']))
         want = bytearray(10240)
         for x, y in pix:
             if 0 <= x < 320 and 0 <= y < 256:
                 want[y * 40 + (x >> 3)] |= 0x80 >> (x & 7)
-        got = a.mem.r_block(bpl2, 10240)
+        got = a.mem.r_block(bpl2 + 2, 10240)
         wire_frames[0] += 1
         if got != bytes(want):
             bad = [i // 40 for i in range(10240) if got[i] != want[i]]
@@ -793,10 +813,12 @@ def main():
     # starts at display line 244. `scroller` is entered when the stars are done and `wire`
     # when the scroller is done; both times are measured from the moment the loop left the
     # frame-sync wait, converted to the beam line it was at.
+    logo_slack = []
     star_slack, scr_slack = [], []
     for i, t0 in enumerate(a.exit_times[:len(a.t_marks.get('wire', []))]):
         line0 = (t0 // LINE_CYCLES) % FRAME_LINES
         lines_to = lambda target: ((FRAME_LINES - line0) + target) * LINE_CYCLES
+        logo_slack.append(lines_to(44 + 8) - (a.t_marks['stars'][i] - t0))
         star_slack.append(lines_to(44 + 76) - (a.t_marks['scroller'][i] - t0))
         scr_slack.append(lines_to(44 + 200) - (a.t_marks['wire'][i] - t0))
     ts = [m - e for m, e in zip(a.t_marks['scroller'], a.exit_times)]
@@ -804,8 +826,9 @@ def main():
     tall = [t1 - t0 for t0, t1 in zip(a.exit_times, fm[1:])]
     print('  cost split (avg cycles): mod+raster+stars %d, scroller %d, wireframe+rest %d'
           % (sum(ts) // len(ts), sum(tw) // len(tw), sum(tall[:len(ts)]) // len(ts) - sum(ts) // len(ts) - sum(tw) // len(tw)))
-    print('  stars finish %d cycles before the beam reaches them (worst frame); scroller %d cycles before its strip'
-          % (min(star_slack), min(scr_slack)))
+    print('  wave+bars finish %d cycles before the beam reaches the logo; stars %d before the starfield; scroller %d before its strip (worst frame)'
+          % (min(logo_slack), min(star_slack), min(scr_slack)))
+    check(min(logo_slack) > 0, 'the wave and bar rows are still being rewritten when the beam reaches the logo (%d cycles late)' % -min(logo_slack))
     check(min(star_slack) > 0, 'stars are still being drawn when the beam reaches the starfield band (flicker/tearing)')
     check(min(scr_slack) > 0, 'the scroller is still being shifted when the beam reaches its strip (tearing)')
     # Wireframe buffers must alternate every frame: the Copper never points at the buffer being drawn.
@@ -876,9 +899,10 @@ def main():
     check(sn['diw'] == (0x2C, 0x12C), 'display window lines %s, expected (44, 300)' % (sn['diw'],))
     scr = mem.r32(a.sym('reloc_table') + 0)
     P = 10240
-    check(sn['ptr'][0] == scr, 'plane 0 pointer $%X != $%X' % (sn['ptr'][0], scr))
-    check(sn['ptr'][2] == scr + 3 * P, 'plane 2 pointer $%X != $%X' % (sn['ptr'][2], scr + 3 * P))
-    check(sn['ptr'][1] in (scr + P, scr + 2 * P), 'plane 1 pointer $%X is not one of the two wireframe buffers' % sn['ptr'][1])
+    check(sn['ddf'][:4] == (0x30, 0xD0, 21, -2), 'display fetch setup (DDFSTRT, DDFSTOP, words, modulo) is %s' % (sn['ddf'][:4],))
+    check(sn['ptr'][0] == scr - 2, 'plane 0 pointer $%X != $%X (planes start one word early)' % (sn['ptr'][0], scr - 2))
+    check(sn['ptr'][2] == scr + 3 * P - 2, 'plane 2 pointer $%X != $%X' % (sn['ptr'][2], scr + 3 * P - 2))
+    check(sn['ptr'][1] in (scr + P - 2, scr + 2 * P - 2), 'plane 1 pointer $%X is not one of the two wireframe buffers' % sn['ptr'][1])
     n = snap_frame
     equ = lambda name: a.consts[name]
     # ---- expected planes
@@ -911,7 +935,7 @@ def main():
     edges = [(eb[i], eb[i + 1]) for i in range(0, len(eb), 2)]
     wire_ok = n >= 3
     if wire_ok:
-        pix, proj = ref_wire(n - 2, verts, edges, (equ('WIRE_D'), equ('WIRE_ZOFF'), equ('MID_CX'), equ('MID_CY')))
+        pix, proj = ref_wire(n - 2, verts, edges, (equ('WIRE_D'), equ('WIRE_ZOFF'), equ('MID_CX'), equ('MID_CY'), equ('WIRE_SWAY'), equ('WIRE_ZOOM')))
         outside = [p for p in pix if not (0 <= p[0] < 320 and MID_Y0 <= p[1] < MID_Y0 + MID_H)]
         check(not outside, 'the wireframe leaves its %d line band: %s' % (MID_H, outside[:3]))
         for x, y in pix:
@@ -932,7 +956,38 @@ def main():
     check(pbl[44 + 8][1] == 0xFFF, 'logo top colour $%03X, expected white' % pbl[44 + 8][1])
     check(pbl[44 + 100][1] == 0xAAD, 'middle band mid-star colour is $%03X, expected $AAD' % pbl[44 + 100][1])
     check(all(pbl[44 + 100][i] == 0x3FC for i in (2, 3, 6, 7)), 'wireframe colours (2, 3, 6, 7) differ')
-    check(pbl[44 + 222][0] == 0x102, 'Copper wrap below line 255 failed: floor colour at display line 266 is $%03X' % pbl[44 + 222][0])
+    # ---- wavy logo: BPLCON1 per row, and the logo as actually displayed
+    import gen_tables
+    px = sn['px']
+    f = n - 1                                          # frame_no after n-1 completed iterations
+    sine = [int(round(127 * math.sin(2 * math.pi * i / 256))) for i in range(256)]
+    wave_bad, shown_bad = [], 0
+    for r in range(LOGO_H):
+        want_sc = gen_tables.wave_tab()[(((f << 2) & 0xFFFF) + 3 * r) & 255]
+        v = want_sc & 15
+        got_sc = sn['bplcon1_by_line'][44 + LOGO_Y + r]
+        if got_sc != want_sc:
+            wave_bad.append((r, got_sc, want_sc))
+        for x in range(v, 320):                        # (the first v pixels show the previous row's tail)
+            want_bit = (logo[r * 40 + ((x - v) >> 3)] >> (7 - ((x - v) & 7))) & 1
+            if (px[LOGO_Y + r][x] & 1) != want_bit:
+                shown_bad += 1
+    check(not wave_bad, 'wavy logo: BPLCON1 differs on %d rows, first (row, got, want) %s' % (len(wave_bad), wave_bad[:2]))
+    check(shown_bad == 0, 'the displayed logo differs from the logo shifted by BPLCON1 in %d pixels (fetch/modulo model)' % shown_bad)
+    others = [y for y in range(256) if not LOGO_Y <= y < LOGO_Y + LOGO_H and sn['bplcon1_by_line'][44 + y] != 0]
+    check(not others, 'BPLCON1 is not back to 0 outside the logo (rows %s...)' % others[:4])
+    # ---- copper-bar floor (all of it lies below display line 255, so this also proves the Copper wrap)
+    FY0, FH = gen_tables.FLOOR_Y0, gen_tables.FLOOR_H
+    rows = list(gen_tables.floor_base())
+    bc = gen_tables.bar_colors()
+    for k in range(gen_tables.NBARS):
+        top = ((sine[(((f * (k + 2)) & 0xFFFF) + 64 * k) & 255] * 13) >> 7) + FH // 2 - 4
+        for j in range(8):
+            if 0 <= top + j < FH:
+                rows[top + j] = bc[k * 8 + j]
+    got_rows = [pbl[44 + FY0 + i][0] for i in range(FH)]
+    check(got_rows == rows, 'floor bar rows (below display line 255, after the Copper wrap) differ: first %s' %
+          [(i, hex(g), hex(w)) for i, (g, w) in enumerate(zip(got_rows, rows)) if g != w][:2])
     pal = [0x102,0x203,0x304,0x405,0x506,0x607,0x708,0x819,0x92A,0xA3B,0xB4C,0xC5D,0xD6E,0xE7F,0xD6E,0xC5D,
            0xB4C,0xA3B,0x92A,0x819,0x708,0x607,0x506,0x405,0x304,0x203,0x102,0x213,0x324,0x435,0x546,0x657]
     check(pbl[44 + 73][0] in pal, 'raster slot colour $%03X is not from the colour table' % pbl[44 + 73][0])

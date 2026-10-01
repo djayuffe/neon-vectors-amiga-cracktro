@@ -33,15 +33,19 @@ bitplane memory while it runs on an emulated 68000. It is not a capture from a r
 ## Features
 
 - PAL 320×256 low resolution, 3 bitplanes / 8 colours, Copper-driven display
+- **Wavy logo**: every logo row has its own `BPLCON1` horizontal-scroll move in the Copper list,
+  rewritten each frame as a sine wave (the display fetches one extra word per line to allow it)
 - **Copper gradients**: the logo text and its background shade from white through gold to orange
-  every two lines; the scroller strip has its own gradient and frame lines; colour bars form a
-  floor below; one animated bar pulses under the logo
+  on every row; the scroller strip has its own gradient and frame lines; one animated bar pulses
+  under the logo
+- **Copper bars**: four coloured raster bars glide up and down in the floor below the scroller
 - Two-line **`UBER` / `CRACKING SERVICE` logo**, generated from an embedded font
 - **3D starfield**: 64 stars flying out of the screen with perspective projection, in three depth
   brightnesses (far, mid, near) made from the free bitplane combinations
 - **3D wireframe**: a cube and a counter-rotating octahedron (24 edges), rotated with 7-bit fixed
   point matrices, perspective-projected, and drawn with the **blitter in line mode** into a
-  **double-buffered** bitplane, so a half-drawn frame is never shown
+  **double-buffered** bitplane, so a half-drawn frame is never shown; the object also sways left and
+  right and breathes in and out along a motion path
 - MSB-first planar text scroller, double height, shifted with a longword `ROXL` chain
 - Real 31-instrument `M.K.` MOD, all four Paula channels, reliable DMA retrigger and silent
   termination for one-shot samples
@@ -90,7 +94,7 @@ separate link step. Other targets:
 | `make verify-repro` | Generate the assets twice and require identical SHA-256 hashes |
 | `make mutants` | Self-test of the validator: inject 33 faults, require each to be reported |
 | `make emutest` | Run the assembled program on an emulated 68000 and check its behaviour |
-| `make emu-mutants` | Self-test of the emulation test: inject 14 faults, require each to fail it (slow) |
+| `make emu-mutants` | Self-test of the emulation test: inject 19 faults, require each to fail it (slow) |
 | `make release` | `clean`, build, reproducibility check, regenerate `MANIFEST.sha256` |
 | `make clean` / `make distclean` | Remove `build/` / also remove the generated assets |
 
@@ -130,7 +134,7 @@ Four independent layers, from cheap and static to behavioural:
 make validate      # static: assets + 68000 source rules
 make mutants       # the validator must catch 33/33 injected faults
 make emutest       # dynamic: run the real binary on an emulated 68000
-make emu-mutants   # the emulation test must catch 14/14 injected faults
+make emu-mutants   # the emulation test must catch 19/19 injected faults
 ```
 
 **`make validate`** (`tools/validate.py`) checks the generated assets (MOD structure, sample
@@ -148,19 +152,22 @@ interpreter. It verifies, among other things:
   memory, no library and no `Forbid`/`Disable` nesting behind, and preserves every register
 - DMACON/INTENA/ADKCON are restored, audio DMA is left off, and `WaitTOF` is never called with the
   vertical-blank interrupt masked
-- the loop advances exactly once per frame, within about 55 % of a frame's CPU budget, and the
-  single-buffered parts (stars, scroller) finish before the beam reaches them
+- the loop advances exactly once per frame, within about 60 % of a frame's CPU budget, and every
+  single-buffered part (logo wave and bar rows, stars, scroller) finishes before the beam reaches it
 - the wireframe buffers alternate every frame
 - every Paula channel start and loop/terminal reload matches the module data
 - the rendered frame is **pixel-exact** against independent Python reference models: logo, every
-  star position and depth class, the scroller band, and the wireframe (reference rotation,
-  perspective and Bresenham) — the wireframe on **every** frame
+  star position and depth class, the scroller band, and the wireframe (reference rotation, motion
+  path, perspective and Bresenham) — the wireframe on **every** frame
+- the display model (extra fetch word, modulo, per-row `BPLCON1`) shows the logo exactly as the wave
+  table says, `BPLCON1` returns to 0 below the logo, and the floor bars match their reference
 - the failure paths: chip allocation failure (`--alloc-fast`), a loader that honours the chip flag
   (`--loader-chip`), and a 262-line NTSC frame (`--ntsc`) where the PAL-only intro must not hang
 
 The harness itself was mutation-tested (`make emu-mutants`): re-injecting swapped octant-table
 entries, `ONEDOT`, a missing buffer swap, a short band clear, a wrong matrix sign, missing star
-erase, a scroller overrun, blitter DMA off, a missing Copper wrap, an off-by-one `AUDxLEN`, swapped
+erase, a scroller overrun, blitter DMA off, a missing Copper wrap, a wrong wave step, a wave that is
+never reset, a wrong display modulo, misplaced bar writes, an ignored sway, an off-by-one `AUDxLEN`, swapped
 `CopyMem` arguments, missing frame-sync edge detection, leaked memory and a masked interrupt before
 `WaitTOF` each makes it fail.
 
@@ -196,10 +203,10 @@ PAL OCS/ECS machine before calling a release final; the checklist is in
    Copper list, restore ADKCON/INTENA/DMACON, `Enable()` then `Permit()`, `WaitTOF`, release the
    blitter, free the chip block, close the library, return.
 
-**CPU budget.** About 71 000 cycles per frame on average and 80 000 worst case on the emulated
-CPU (a frame is about 142 000), measured without DMA contention. The starfield and scroller are
-single-buffered, so they must finish before the beam reaches them; the test measures this margin
-(about 18 000 cycles for the stars in the worst frame). The wireframe is double-buffered precisely
+**CPU budget.** About 77 000 cycles per frame on average and 84 000 worst case on the emulated
+CPU (a frame is about 142 000), measured without DMA contention. The logo wave and bar rows, the
+starfield and the scroller are single-buffered, so each must finish before the beam reaches it; the
+test measures these margins (about 19 000, 18 000 and 64 000 cycles in the worst frame). The wireframe is double-buffered precisely
 because it takes most of a frame.
 
 More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/GFX.md`](docs/GFX.md),
@@ -215,7 +222,7 @@ src/
 assets/             generated and checked in: logo.raw, font.raw, neon.mod, logo_preview.png
 tools/
   generate_assets.py  deterministic logo/font/MOD/PNG generator (no external dependencies)
-  gen_tables.py       prints the Copper gradient, sine and reciprocal tables pasted into main.s
+  gen_tables.py       prints the Copper gradient, wave, bar, sine and reciprocal tables pasted into main.s
   validate.py         static asset + source validator (gates the build)
   mutate.py           mutation self-test of the validator
   emu_test.py         behavioural test on an emulated 68000 (blitter + Copper model, reference renderers)
@@ -236,8 +243,11 @@ MANIFEST.sha256     SHA-256 of every shipped file
 - **Colours and gradients** — edit the ramps in `tools/gen_tables.py`, run
   `python3 tools/gen_tables.py copper` and paste the result over the gradient section of the
   Copper list in `src/main.s`.
+- **Wave and bars** — the wave table, the bar colours and the floor ramp come from `tools/gen_tables.py`
+  (`wave_tab`, `bar_colors`, `floor_base`); the speeds are the phase steps in `UpdateWave`/`UpdateBars`.
 - **Wireframe** — the vertices and edges are the `verts` and `edges` tables in `src/main.s`; keep the
   object inside its 120-line band (there is no clipping — `make emutest` fails if it leaves it).
+  `WIRE_SWAY` and `WIRE_ZOOM` set the motion path.
   The projection constants are `WIRE_D` and `WIRE_ZOFF`; if you change them, regenerate the
   `recip_wire` table with `tools/gen_tables.py`.
 - **Starfield** — `NSTARS`, `ZSPEED`, `PROJ_F` and the depth thresholds are constants at the top of

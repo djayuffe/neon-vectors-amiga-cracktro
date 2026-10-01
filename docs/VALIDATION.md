@@ -10,7 +10,7 @@ mutation self-test keep known mistakes from coming back.
 | Self-test | `make mutants` | validator must detect all 33 injected faults |
 | Assembler | `make` | VASM assembles; `hunkcheck.py` parses the executable |
 | Behaviour | `make emutest` | real binary on an emulated 68000 |
-| Behaviour self-test | `make emu-mutants` | the emulation test must fail for all 14 injected faults (slow) |
+| Behaviour self-test | `make emu-mutants` | the emulation test must fail for all 19 injected faults (slow) |
 
 ## `tools/validate.py` — assets
 
@@ -67,15 +67,18 @@ algorithm, and the D-only rectangle clear. Any other blit is reported rather tha
 
 It asserts memory balance (with guard bytes around the allocation), register and stack
 preservation, restored chipset state, exactly one loop iteration per frame, the CPU budget, the
-single-buffered deadlines (stars before the beam reaches the starfield, scroller before its strip),
+single-buffered deadlines (wave and bar rows before the beam reaches the logo, stars before the
+starfield, scroller before its strip), the display fetch setup and the displayed logo under the wave,
 alternating wireframe buffers, every audio trigger and reload against the module, and pixel-exact
 planes against independent Python reference models: the logo, every star position and depth class,
-every scroller pixel, and the wireframe (reference matrix, perspective and Bresenham) — the last on
+every scroller pixel, the wave and bar rows, and the wireframe (reference matrix, motion path,
+perspective and Bresenham) — the last on
 **every frame**, including the rows outside the band.
 
 The harness was itself mutation-tested (`make emu-mutants`): swapped octant table entries,
 `ONEDOT` set, no double buffering, a short band clear, a wrong rotation-matrix sign, missing star
-erase, a scroller overrun, blitter DMA never enabled, a missing Copper wrap, `AUDxLEN` off by one,
+erase, a scroller overrun, blitter DMA never enabled, a missing Copper wrap, a wrong wave step, a
+wave that is never reset, a wrong display modulo, misplaced bar writes, an ignored sway, `AUDxLEN` off by one,
 swapped `CopyMem` arguments, missing frame-sync edge detection, leaked memory and a masked
 vertical-blank interrupt before `WaitTOF`.
 

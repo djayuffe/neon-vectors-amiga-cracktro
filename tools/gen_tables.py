@@ -4,6 +4,8 @@
     python3 tools/gen_tables.py copper   # Copper colour-gradient WAIT/MOVE lines
     python3 tools/gen_tables.py sintab   # 256-entry sine table, amplitude 127
     python3 tools/gen_tables.py recip_star | recip_wire   # reciprocal tables that replace divisions
+    python3 tools/gen_tables.py floor_base | bar_colors   # copper-bar floor tables
+    python3 tools/gen_tables.py wave_tab                  # BPLCON1 values of the wavy logo
 
 The output is deterministic. It is kept as a script (rather than generated at build
 time) so the assembler input stays a single readable file that the validator can parse.
@@ -26,16 +28,35 @@ def ramp(stops, t):
 
 DISPLAY_TOP = 44            # first display line; screen y maps to line y + 44
 
+FLOOR_Y0, FLOOR_H = 222, 34          # copper-bar floor: rows 222..255, one WAIT per row
+NBARS = 4
+
+def floor_base():
+    """Static floor colour per row (a dark purple ramp) that the animated bars are drawn over."""
+    fl = [(0.0, 0x102), (1.0, 0x424)]
+    return [ramp(fl, i / (FLOOR_H - 1)) for i in range(FLOOR_H)]
+
+def bar_colors():
+    """NBARS bars of 8 rows each: a colour with a soft bright core (intensity 1-2-3-4-4-3-2-1 / 4)."""
+    bases = [0xF3C, 0x3DF, 0xFC3, 0x4F7]            # magenta, cyan, gold, green
+    prof = [1, 2, 3, 4, 4, 3, 2, 1]
+    out = []
+    for base in bases:
+        for pk in prof:
+            out.append(lerp(0x001, base, pk / 4))
+    return out
+
 def copper():
-    ent = []                # (y, [(reg, value)])
-    # Logo band, y 8..71: text colour (COLOR01) and background (COLOR00), every 2 lines.
+    ent = []                # (y, regs) ; regs None = animated slot, 'wave' = wavy logo row, 'bar' = floor row
+    # Logo band, y 8..71: text colour (COLOR01) and background (COLOR00) shade every row, and each
+    # row has a BPLCON1 move that UpdateWave rewrites every frame (a sine wave of horizontal scroll).
     text = [(0.0, 0xFFF), (0.35, 0xFF9), (0.6, 0xFB4), (1.0, 0xE52)]
     bg = [(0.0, 0x002), (1.0, 0x214)]
-    for i in range(32):
-        t = i / 31
-        ent.append((8 + 2 * i, [('COLOR00', ramp(bg, t)), ('COLOR01', ramp(text, t))]))
-    ent.append((72, None))                                   # animated raster slot, 4 lines
-    # Middle band, y 76..195: mid-distance star colour plus a faint depth gradient behind.
+    for i in range(64):
+        t = i / 63
+        ent.append((8 + i, [('COLOR00', ramp(bg, t)), ('COLOR01', ramp(text, t)), ('BPLCON1', 0x88)]))
+    ent.append((72, None))                                   # animated raster slot, then the wave reset
+    # Middle band, y 76..195: mid-distance star colour plus a soft glow behind.
     ent.append((76, [('COLOR00', 0x001), ('COLOR01', 0xAAD)]))
     mid = [(0.0, 0x001), (0.5, 0x024), (1.0, 0x001)]
     for i in range(1, 15):
@@ -49,12 +70,13 @@ def copper():
         ent.append((200 + 2 * i, [('COLOR01', ramp(sc, i / 7))]))
     ent.append((218, [('COLOR00', 0x6CF)]))
     ent.append((219, [('COLOR00', 0x001)]))
-    # Floor bars below the scroller, y 222..255, every 4 lines.
-    fl = [(0.0, 0x102), (1.0, 0x63A)]
-    for i in range(9):
-        ent.append((222 + 4 * i, [('COLOR00', ramp(fl, i / 8) if i % 2 == 0 else 0x001)]))
+    # Copper-bar floor, y 222..255: one COLOR00 move per row; UpdateBars repaints them each frame.
+    fb = floor_base()
+    for i in range(FLOOR_H):
+        ent.append((FLOOR_Y0 + i, ('bar', fb[i])))
     ent.sort(key=lambda e: e[0])
     lines, wrapped = [], False
+    first_wave = first_bar = True
     for y, regs in ent:
         v = DISPLAY_TOP + y
         if v > 255 and not wrapped:
@@ -62,14 +84,35 @@ def copper():
             wrapped = True
         pos = ((v - 256) if wrapped else v) << 8 | 1
         if regs is None:
-            lines.append('        dc.w $%04X,$FFFE                    ; y=72: animated slot' % pos)
+            lines.append('        dc.w $%04X,$FFFE                    ; y=72: animated slot, then the wave ends' % pos)
             lines.append('cop_raster_color:')
             lines.append('        dc.w COLOR00,$013                   ; animated by UpdateRaster each frame')
+            lines.append('        dc.w BPLCON1,$0000')
+        elif isinstance(regs, tuple):
+            if first_bar:
+                lines.append('cop_bars:                                   ; 34 rows of WAIT + COLOR00, 8 bytes each (value at +6)')
+                first_bar = False
+            lines.append('        dc.w $%04X,$FFFE,COLOR00,$%04X' % (pos, regs[1]))
         else:
+            if first_wave:
+                lines.append('cop_wave:                                   ; 64 rows, 16 bytes each (BPLCON1 value at +14)')
+                first_wave = False
             body = ','.join('%s,$%04X' % (r, val) for r, val in regs)
             lines.append('        dc.w $%04X,$FFFE,%s' % (pos, body))
     lines.append('        dc.w $FFFF,$FFFE')
     return '\n'.join(lines)
+
+def wave_tab():
+    # 256 BPLCON1 values for the wavy logo: 8 + round-down(sin * 6 / 128), same nibble for both playfields.
+    vals = []
+    for k in range(256):
+        sv = int(round(127 * math.sin(2 * math.pi * k / 256)))
+        v = 8 + ((sv * 6) >> 7)
+        vals.append(v | (v << 4))
+    return vals
+
+def words(vals, per=16):
+    return '\n'.join('        dc.w ' + ','.join('$%03X' % v for v in vals[i:i + per]) for i in range(0, len(vals), per))
 
 def recip_star():
     # 256 entries: round(PROJ_F * 256 / z) for z = 32..255 (z below 32 never occurs).
@@ -86,4 +129,6 @@ def sintab():
     return '\n'.join('        dc.w ' + ','.join('%d' % v for v in vals[i:i + 16]) for i in range(0, 256, 16))
 
 if __name__ == '__main__':
-    print({'copper': copper, 'sintab': sintab, 'recip_star': recip_star, 'recip_wire': recip_wire}[sys.argv[1]]())
+    print({'copper': copper, 'sintab': sintab, 'recip_star': recip_star, 'recip_wire': recip_wire,
+           'floor_base': lambda: words(floor_base()), 'bar_colors': lambda: words(bar_colors(), 8),
+           'wave_tab': lambda: words(wave_tab())}[sys.argv[1]]())
