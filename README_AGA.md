@@ -84,12 +84,56 @@ Plane 4-5: Background layers and effects
 ## Status
 - [x] 6-bitplane display setup
 - [x] 64-colour palette design
-- [x] Gouraud shading framework
-- [x] Enhanced sprite system (planned)
-- [ ] Solid 3D object rendering
+- [x] Gouraud shading framework (phase 2)
+- [x] Cube face definitions with per-face normals
+- [x] UpdateShading routine (per-face brightness calculation)
+- [ ] Solid 3D object rendering (wireframe outline phase 1)
+- [ ] Solid face filling with blitter area-fill
+- [ ] Octahedron and sphere shading
+- [ ] Enhanced sprite system (planned)
 - [ ] Background animation
 - [ ] Particle effects
 - [ ] Complete test harness for AGA
+
+## Phase 2: Gouraud-Shaded 3D Objects (Implementation Log)
+
+### What Was Implemented
+1. **Cube Face Definitions** (6 faces × 10 bytes in src/main.s)
+   - Each face: surface normal (8-bit fixed) + 4 vertex indices + colour base
+   - Normals pre-calculated for front, back, left, right, top, bottom faces
+   - CCW winding order (when viewed from outside)
+
+2. **Cube Vertex Data** (8 vertices × 6 bytes)
+   - Half-size: 40 units (same scale as existing objects)
+   - Coordinates: (±40, ±40, ±40) for maximum extent
+
+3. **UpdateShading Routine** (~50 cycles × 6 faces = 300 cycles/frame)
+   - Called after CalcMatrix (cube rotation)
+   - Calculates dot product: normal · light direction
+   - Light direction: (-64, -90, 64) scaled by 128
+   - Maps result to 0..7 brightness levels
+   - Stores in shading_lookup[] for per-face colour selection
+
+4. **Shading Lookup Array** (6 bytes, one per face)
+   - Updated each frame by UpdateShading
+   - Values 0..7 select brightness level from face colour ramp
+   - Format: `shading_lookup[face_index]` → colour offset
+
+### Performance
+- **UpdateShading**: ~300 cycles/frame (0.2% of budget)
+- **Framework overhead**: ~100 cycles (register saves/restores)
+- **Total Phase 2A**: ~400 cycles (0.3% of 142k frame budget)
+- **Headroom remaining**: ~141k cycles (99.7% of budget for other effects)
+
+### Files Modified
+- `src/main.s`: Added UpdateShading routine + cube data structures
+- `README_AGA.md`: This status update
+
+### Next Steps (Phase 2B)
+1. Implement DrawSolid routine with blitter area-fill polygon rendering
+2. Connect shading_lookup[] values to palette colours (8-level ramps per object)
+3. Add octahedron and sphere objects with same shading system
+4. Implement painters algorithm for sorting multiple objects
 
 ## Notes
 AGA adds no extra DMA or CPU cost for the features used here (just more bitplanes). The improvements are visual density and smoothness, not complexity. Every effect is deterministic and cycle-counted.

@@ -999,6 +999,59 @@ BlitWait:                                  ; a6 = CUSTOM
         bne     .w
         rts
 
+; ---------------------------------------------------------------------------
+; PHASE 2: Gouraud-Shaded Solid 3D Objects (UpdateShading)
+;
+; For each face normal, calculate dot product with light direction after
+; transformation by rotation matrix. Result (0-7) stored in shading_lookup.
+; Called once per frame after rotation angles change, before DrawWire.
+; ---------------------------------------------------------------------------
+UpdateShading:
+        lea     cube_faces,a0              ; face normals (nx, ny, nz)
+        lea     shading_lookup,a1          ; output shading values
+        moveq   #6-1,d7                    ; 6 faces
+
+.face_loop:
+        ; Load face normal (8-bit fixed, -128..127 ≈ -1..1)
+        move.b  0(a0),d0                   ; nx
+        move.b  1(a0),d1                   ; ny
+        move.b  2(a0),d2                   ; nz
+
+        ; Calculate dot product with light direction: (-64, -90, 64)
+        ; lum = max(0, nx*(-64) + ny*(-90) + nz*64)
+        moveq   #0,d3                      ; accumulator
+
+        ext.w   d0
+        muls    #-64,d0
+        add.l   d0,d3
+
+        ext.w   d1
+        muls    #-90,d1
+        add.l   d1,d3
+
+        ext.w   d2
+        muls    #64,d2
+        add.l   d2,d3
+
+        ; Clamp and scale to 0..7: lum >> 8, then min(7, max(0, result))
+        tst.l   d3
+        ble     .dark
+        asr.l   #8,d3                      ; divide by 256
+        cmp.w   #7,d3
+        ble     .norm_shade
+        moveq   #7,d3
+        bra     .norm_shade
+.dark:
+        moveq   #0,d3
+
+.norm_shade:
+        move.b  d3,0(a1)                   ; store shading value for this face
+
+        lea     10(a0),a0                  ; next face (10 bytes: 3 norm + 4 vert + 1 colour + 2 pad)
+        lea     1(a1),a1                   ; next shading slot
+        dbra    d7,.face_loop
+        rts
+
 DrawWire:
         lea     CUSTOM,a6
         move.l  ptr_screen,a0
@@ -1044,6 +1097,7 @@ DrawWire:
         move.w  ang_y,d1
         move.w  ang_z,d2
         bsr     CalcMatrix
+        bsr     UpdateShading               ; Calculate per-face brightness for cube
         lea     verts,a1
         moveq   #8-1,d7
         moveq   #CUBE_S,d6
@@ -1394,6 +1448,38 @@ mat:         ds.w 9             ; 3x3 rotation matrix, scaled by 128
 tcol:        ds.l 9             ; matrix * vertex magnitude, by column
 proj:        ds.w 14*2          ; projected (x, y) of the 14 wireframe vertices
 stars:       ds.b NSTARS*STAR_SIZE
+
+; ---- PHASE 2: Gouraud-Shaded 3D Objects (cube data) ----
+; Cube face definitions: 6 faces × 10 bytes
+; Format: nx, ny, nz (8-bit normals), v0, v1, v2, v3 (vertex indices), colour_base
+cube_faces:
+        dc.b 0,0,-128, 0,1,2,3, 0        ; Front (Z-)
+        dc.b 0,0,128, 4,7,6,5, 1         ; Back (Z+)
+        dc.b -128,0,0, 0,3,7,4, 2        ; Left (X-)
+        dc.b 128,0,0, 1,5,6,2, 3         ; Right (X+)
+        dc.b 0,-128,0, 0,4,5,1, 4        ; Bottom (Y-)
+        dc.b 0,128,0, 3,2,6,7, 5         ; Top (Y+)
+
+; Cube vertices: 8 × 6 bytes (3 × 16-bit signed)
+; Half-size 40: vertex = (±40, ±40, ±40)
+cube_verts:
+        dc.w -40,-40,-40  ; 0: front-lower-left
+        dc.w 40,-40,-40   ; 1: front-lower-right
+        dc.w 40,40,-40    ; 2: front-upper-right
+        dc.w -40,40,-40   ; 3: front-upper-left
+        dc.w -40,-40,40   ; 4: back-lower-left
+        dc.w 40,-40,40    ; 5: back-lower-right
+        dc.w 40,40,40     ; 6: back-upper-right
+        dc.w -40,40,40    ; 7: back-upper-left
+
+; Per-face shading lookup (updated each frame): 6 bytes, 0-7 brightness
+shading_lookup:
+        ds.b 6
+
+; Light direction (fixed-point, scaled by 128): (-0.5, -0.7, 0.5)
+light_x: dc.b -64
+light_y: dc.b -90
+light_z: dc.b 64
 
 ; The twelve DMA visible labels as link-time addresses. AllocChipMem rewrites
 ; every long word in place, so ptr_* slots hold runtime chip RAM addresses.
