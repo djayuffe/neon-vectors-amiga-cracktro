@@ -122,4 +122,9 @@ results.append(M_('Forbid LVO wrong', 'src/hardware.i',
 results = [r for r in results if r is not None]
 print()
 print(f'mutations caught: {sum(1 for r in results if r)}/{len(results)}')
+# A harness that stops finding its own anchors looks exactly like a clean run,
+# so an unmutated but failing tree, or a mutation whose pattern vanished, must
+# not be reported as success.
+if not base_ok:
+    print('FAIL: the unmutated tree does not validate; mutations prove nothing')
 sys.exit(0 if results and all(results) and base_ok else 1)

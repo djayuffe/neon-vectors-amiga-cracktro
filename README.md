@@ -134,7 +134,7 @@ Four independent layers, from cheap and static to behavioural:
 make validate      # static: assets + 68000 source rules
 make mutants       # the validator must catch 33/33 injected faults
 make emutest       # dynamic: run the real binary on an emulated 68000
-make emu-mutants   # the emulation test must catch 19/19 injected faults
+make emu-mutants   # the emulation test must catch 25/25 injected faults
 ```
 
 **`make validate`** (`tools/validate.py`) checks the generated assets (MOD structure, sample

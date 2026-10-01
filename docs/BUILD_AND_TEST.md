@@ -10,7 +10,7 @@
 | 68000 assembly | `make` | assembles with VASM 2.0f, no errors |
 | Hunk executable structure | `make` (`hunkcheck.py`) | valid; 3 hunks (code, data, chip data) |
 | Behaviour on an emulated 68000 | `make emutest` | passes (PAL, `--loader-chip`, `--alloc-fast`, `--ntsc`) |
-| Emulation-test self-test | `make emu-mutants` | 19/19 injected faults caught |
+| Emulation-test self-test | `make emu-mutants` | 25/25 injected faults caught, after an unmodified baseline run passes |
 | Cycle-exact emulator | FS-UAE, A500 config, AROS ROM | runs, animates, exits cleanly; audio not audited by ear |
 | Genuine Kickstart ROM | FS-UAE / WinUAE / Amiberry | **not run** |
 | Real PAL OCS/ECS machine | — | **not run** |

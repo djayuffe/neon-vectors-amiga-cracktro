@@ -10,7 +10,7 @@ mutation self-test keep known mistakes from coming back.
 | Self-test | `make mutants` | validator must detect all 33 injected faults |
 | Assembler | `make` | VASM assembles; `hunkcheck.py` parses the executable |
 | Behaviour | `make emutest` | real binary on an emulated 68000 |
-| Behaviour self-test | `make emu-mutants` | the emulation test must fail for all 19 injected faults (slow) |
+| Behaviour self-test | `make emu-mutants` | an unmodified baseline run passes, then all 25 injected faults are caught (slow) |
 
 ## `tools/validate.py` — assets
 
@@ -79,8 +79,15 @@ The harness was itself mutation-tested (`make emu-mutants`): swapped octant tabl
 `ONEDOT` set, no double buffering, a short band clear, a wrong rotation-matrix sign, missing star
 erase, a scroller overrun, blitter DMA never enabled, a missing Copper wrap, a wrong wave step, a
 wave that is never reset, a wrong display modulo, misplaced bar writes, an ignored sway, `AUDxLEN` off by one,
-swapped `CopyMem` arguments, missing frame-sync edge detection, leaked memory and a masked
-vertical-blank interrupt before `WaitTOF`.
+swapped `CopyMem` arguments, missing frame-sync edge detection, leaked memory, a masked
+vertical-blank interrupt before `WaitTOF`, an unpatched sprite pointer, an off-by-one `HSTART`, sprite
+DMA never enabled, a ring wobble ignoring the tilt, and a wireframe vertex sign error.
+
+That harness first runs the **unmodified** program and requires it to pass. Without that step a
+broken emulator stub or a missing dependency would make every mutant "fail" by crashing, which
+looks identical to a genuine detection. `tools/mutate.py` applies the same reasoning: it fails
+explicitly if the unmutated tree does not validate, because a validator that rejects everything
+proves nothing about the faults it should catch.
 
 What it cannot prove: DMA cycle stealing, real beam timing, blitter *timing*, and anything about
 how the picture or sound *looks* or *sounds* on a real Amiga. The blitter's line mode was checked

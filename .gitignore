@@ -2,6 +2,10 @@
 build/
 assets/.generated
 
+# assembler scratch files produced by running vasm by hand from the root
+a.out
+*.lst
+
 # toolchain downloaded by `make toolchain`
 tools/bin/
 tools/vendor/

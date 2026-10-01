@@ -64,7 +64,7 @@ MUTANTS = [
      '        move.w  old_intena,d0\n        andi.w  #$7FFF,d0\n        ori.w   #$8000,d0\n        move.w  d0,INTENA(a6)\n', '', 'hang'),
 ]
 
-def run(name, rel, old, new, expect):
+def populate():
     if M.exists():
         shutil.rmtree(M)
     M.mkdir(parents=True)
@@ -73,13 +73,19 @@ def run(name, rel, old, new, expect):
     bin_dir = R / 'tools/bin'
     if bin_dir.exists():
         shutil.copytree(bin_dir, M / 'tools/bin')
+
+def emu():
+    return subprocess.run([sys.executable, str(M / 'tools/emu_test.py'), '--frames', '300', '--snap', '250'],
+                          capture_output=True, text=True)
+
+def run(name, rel, old, new, expect):
+    populate()
     f = M / rel
     s = f.read_text()
     if old not in s:
         print(f'{name:<50} SETUP ERROR: pattern not found'); return False
     f.write_text(s.replace(old, new, 1))
-    p = subprocess.run([sys.executable, str(M / 'tools/emu_test.py'), '--frames', '300', '--snap', '250'],
-                       capture_output=True, text=True)
+    p = emu()
     out = p.stdout + p.stderr
     if p.returncode == 0:
         print(f'{name:<50} NOT CAUGHT'); return False
@@ -90,6 +96,16 @@ def run(name, rel, old, new, expect):
     return True
 
 if __name__ == '__main__':
+    # Prove the emulator test can pass before asking it to fail. Without this a
+    # broken harness or a missing dependency would "catch" every mutant by
+    # crashing, which is indistinguishable from a real detection.
+    populate()
+    base = emu()
+    base_ok = base.returncode == 0
+    print(f'baseline: {"PASSED (mutants must now be caught)" if base_ok else "BROKEN"}')
+    if not base_ok:
+        print((base.stdout + base.stderr).splitlines()[-1][:90])
+    print()
     results = [run(*m) for m in MUTANTS]
     print(f'\nemulation mutants caught: {sum(results)}/{len(results)}')
-    sys.exit(0 if all(results) else 1)
+    sys.exit(0 if base_ok and all(results) else 1)
