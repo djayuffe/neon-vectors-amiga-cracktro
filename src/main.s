@@ -1599,7 +1599,7 @@ chipdata_begin:
 copper:
         dc.w DIWSTRT,$2C81,DIWSTOP,$2CC1
         dc.w DDFSTRT,$0030,DDFSTOP,$00D0   ; one extra word per line (BPLCON1 scroll), see BPLxMOD
-        dc.w BPLCON0,$4200,BPLCON1,$0000,BPLCON2,$0000   ; 4 bitplanes, 16 colours
+        dc.w BPLCON0,$4200,BPLCON1,$0000,BPLCON2,$0002   ; 4 bitplanes; sprites 4-7 (the far balls) go behind the playfield
         dc.w BPL1MOD,$FFFE,BPL2MOD,$FFFE   ; 21 words fetched, 20 words per line: step back 2 bytes
 cop_bpl1:
         dc.w BPL1PTH,0,BPL1PTL,0

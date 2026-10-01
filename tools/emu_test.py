@@ -594,7 +594,9 @@ class Amiga:
                     c = ((wa >> (15 - bit)) & 1) | (((wb >> (15 - bit)) & 1) << 1)
                     x = hstart - 0x81 + bit
                     if c and 0 <= x < 320 and 0 <= row < len(img):
-                        img[row][x] = pal_by_line[vstart + ln][16 + 4 * (n // 2) + c]
+                        # BPLCON2 PF1P = code: the playfield is in front of sprites 2*code and up
+                        if n >= 2 * (first.get(0x104, 0) & 7) or planes_px[row][x] == 0:
+                            img[row][x] = pal_by_line[vstart + ln][16 + 4 * (n // 2) + c]
         out['spr_pages'] = [mem.r_block(out['spr_ptr'][n], 80) for n in range(8)]
         out['px'] = planes_px
         out['img'] = img
@@ -959,6 +961,7 @@ def main():
     check(sn['diw'] == (0x2C, 0x12C), 'display window lines %s, expected (44, 300)' % (sn['diw'],))
     scr = mem.r32(a.sym('reloc_table') + 0)
     P = 10240
+    check(sn['first'].get(0x104) == 2, 'BPLCON2 is $%04X, expected 2 (far sprites behind the playfield)' % sn['first'].get(0x104, 0))
     check(sn['ddf'][:4] == (0x30, 0xD0, 21, -2), 'display fetch setup (DDFSTRT, DDFSTOP, words, modulo) is %s' % (sn['ddf'][:4],))
     check(sn['ptr'][0] == scr - 2, 'plane 0 pointer $%X != $%X (planes start one word early)' % (sn['ptr'][0], scr - 2))
     check(sn['ptr'][2] == scr + 3 * P - 2, 'plane 2 pointer $%X != $%X' % (sn['ptr'][2], scr + 3 * P - 2))
