@@ -215,6 +215,31 @@ def sintab():
     vals = [int(round(127 * math.sin(2 * math.pi * k / 256))) for k in range(256)]
     return '\n'.join('        dc.w ' + ','.join('%d' % v for v in vals[i:i + 16]) for i in range(0, 256, 16))
 
+
+
+# ---- 64-colour AGA palette ----
+def aga_palette():
+    """64 colours: logo (0-15), logo alt (16-23), sprites (24-35), background (36-47), effects (48-63)."""
+    pal = [0x001] * 64
+    # Logo palette: expanded 16-colour (0-15) + smooth transitions (16-23)
+    logo_base = [0x001, 0x100, 0x631, 0x963, 0xFC4, 0xFE9, 0xFFC, 0xFFF,
+                 0x424, 0x212, 0x246, 0x468, 0x6AC, 0xADF, 0xD42, 0xFFF]
+    pal[0:16] = logo_base
+    # Extra gradients for smooth shading
+    pal[16:24] = [0x975, 0xA86, 0xB97, 0xCA8, 0xDB9, 0xECA, 0xFDB, 0xFFF]
+    # Sprite palette: 3 depth levels * 4 pairs = 12 colours
+    pal[24:36] = [0xA50, 0xFB3, 0xFFD, 0x924, 0xE5A, 0xFCE,
+                  0x146, 0x4AF, 0xCEF, 0x113, 0x35A, 0x8BE]
+    # Background: gradients and effects
+    pal[36:48] = [0x001, 0x011, 0x022, 0x033, 0x044, 0x055,
+                  0x066, 0x077, 0x088, 0x099, 0x0AA, 0x0BB]
+    # Effects: glow, plasma, particles
+    pal[48:64] = [0xF00, 0xF10, 0xF20, 0xF30, 0xF40, 0xF50,
+                  0x0F0, 0x1F0, 0x2F0, 0x3F0, 0x4F0, 0x5F0,
+                  0x00F, 0x10F, 0x20F, 0x30F]
+    return pal
+
+
 if __name__ == '__main__':
     print({'copper': copper, 'sintab': sintab, 'recip_star': recip_star, 'recip_wire': recip_wire,
            'floor_base': lambda: words(floor_base()), 'bar_colors': lambda: words(bar_colors(), 8),

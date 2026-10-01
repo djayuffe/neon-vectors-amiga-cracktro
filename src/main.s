@@ -4,7 +4,7 @@ SCREEN_W_BYTES  EQU 40
 SCREEN_H        EQU 256
 PLANE_SIZE      EQU SCREEN_W_BYTES*SCREEN_H
 PLANE_LONGS     EQU PLANE_SIZE/4
-SCREEN_LONGS    EQU PLANE_LONGS*6
+SCREEN_LONGS    EQU PLANE_LONGS*6   ; 6 planes for 64-colour AGA
 CHIPDATA_SIZE   EQU chipdata_end-chipdata_begin
 FRAME_SYNC_LINE EQU 300     ; first line below the display window (DIWSTOP = line 300)
 SILENCE_WORD    EQU $8080   ; 8 bit Paula silence is unsigned $80, not 0
