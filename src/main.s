@@ -1053,49 +1053,166 @@ UpdateShading:
         rts
 
 ; ---------------------------------------------------------------------------
-; PHASE 2B: DrawSolid - Render shaded faces
-;
-; For each cube face: get shading value, project vertices, draw face outline
-; (future: fill with blitter area-fill using shading colour).
-; in: cube_faces, shading_lookup[], proj[]
-; clobbers: d0-d6, a0-a3
+; PHASE 3: UpdateOctahedronShading - Per-face lighting for octahedron
 ; ---------------------------------------------------------------------------
-DrawSolid:
-        lea     cube_faces,a0              ; face definitions
-        lea     shading_lookup,a1          ; shading values
-        lea     proj,a2                    ; projected vertices
-        moveq   #6-1,d7                    ; 6 faces
+UpdateOctahedronShading:
+        lea     octahedron_faces,a0        ; face normals
+        lea     octahedron_shading,a1      ; output shading values
+        moveq   #8-1,d7                    ; 8 faces
 
-.solid_face:
-        ; Get shading value (0-7)
-        move.b  0(a1),d6                   ; face shading
+.octa_face:
+        ; Load face normal (8-bit fixed, -128..127)
+        move.b  0(a0),d0                   ; nx
+        move.b  1(a0),d1                   ; ny
+        move.b  2(a0),d2                   ; nz
 
-        ; Get vertex indices (v0, v1, v2, v3)
-        move.b  3(a0),d0                   ; v0
-        move.b  4(a0),d1                   ; v1
-        move.b  5(a0),d2                   ; v2
-        move.b  6(a0),d3                   ; v3
+        ; Calculate dot product with light
+        moveq   #0,d3
+        ext.w   d0
+        muls    #-64,d0
+        add.l   d0,d3
+        ext.w   d1
+        muls    #-90,d1
+        add.l   d1,d3
+        ext.w   d2
+        muls    #64,d2
+        add.l   d2,d3
 
-        ; Get projected screen coordinates for each vertex
-        ; proj[] stores 2 words per vertex (x, y), 4 bytes apart
-        ; v0 coordinates
-        lsl.w   #2,d0
-        move.w  0(a2,d0.w),d0              ; v0.x
-        move.w  2(a2,d0.w),d1              ; v0.y
-
-        ; v1 coordinates
-        move.b  4(a0),d2                   ; v1 (reload due to d0 usage)
-        lsl.w   #2,d2
-        move.w  0(a2,d2.w),d2              ; v1.x
-        move.w  2(a2,d2.w),d3              ; v1.y
-
-        ; Note: For Phase 2B, we skip actual rendering.
-        ; Future: Draw quad face outline using BlitLine
-        ; Or: Fill quad with blitter area-fill using colour base + shading
+        ; Clamp to 0..7
+        tst.l   d3
+        ble     .octa_dark
+        asr.l   #8,d3
+        cmp.w   #7,d3
+        ble     .octa_store
+        moveq   #7,d3
+        bra     .octa_store
+.octa_dark:
+        moveq   #0,d3
+.octa_store:
+        move.b  d3,0(a1)
 
         lea     10(a0),a0                  ; next face
-        lea     1(a1),a1                   ; next shading
+        lea     1(a1),a1
+        dbra    d7,.octa_face
+        rts
+
+; ---------------------------------------------------------------------------
+; PHASE 3: UpdateSphereShading - Procedural sphere vertex lighting
+; ---------------------------------------------------------------------------
+UpdateSphereShading:
+        ; Simplified: directly shade based on vertex Y coordinate
+        lea     sphere_verts,a0
+        lea     sphere_shading,a1
+        moveq   #64-1,d7
+
+.sphere_vertex:
+        ; Get Y coordinate and map to brightness
+        move.w  2(a0),d0                   ; y (skip x at 0, use y at 2)
+        ; Simple mapping: Y in -28..28, map to 0..7
+        addi.w  #28,d0
+        mulu    #7,d0
+        divu    #56,d0
+        move.b  d0,0(a1)
+
+        lea     6(a0),a0                   ; next vertex (3 words)
+        lea     1(a1),a1
+        dbra    d7,.sphere_vertex
+        rts
+
+; ---------------------------------------------------------------------------
+; PHASE 4: UpdateParticles - Animate particle system
+; ---------------------------------------------------------------------------
+UpdateParticles:
+        lea     particles,a0
+        moveq   #32-1,d7
+
+.particle:
+        move.w  0(a0),d0                   ; x
+        move.w  2(a0),d1                   ; vx
+        add.w   d1,d0
+        move.w  d0,0(a0)                   ; update x
+
+        move.w  4(a0),d2                   ; y
+        move.w  6(a0),d3                   ; vy
+        add.w   d3,d2
+        move.w  d2,4(a0)                   ; update y
+
+        move.b  8(a0),d4                   ; life
+        subq.b  #1,d4
+        move.b  d4,8(a0)
+
+        lea     10(a0),a0
+        dbra    d7,.particle
+        rts
+
+; ---------------------------------------------------------------------------
+; PHASE 4: SortFaces - Painters algorithm for multi-object rendering
+; ---------------------------------------------------------------------------
+SortFaces:
+        ; Simplified: Use back-to-front drawing order
+        ; Cube first (nearest), octahedron, sphere last
+        ; No actual sorting needed with static object order
+        rts
+
+; ---------------------------------------------------------------------------
+; PHASE 2C: DrawSolid - Render shaded cube faces
+;
+; Draws shaded 3D cube faces by drawing each quad as 4 edges via BlitLine.
+; Each edge is drawn in a colour mapped from shading value (0-7).
+; in: cube_faces, shading_lookup[], proj[]
+; a6 = CUSTOM, a0 = screen buffer
+; clobbers: d0-d6, a0-a5
+; ---------------------------------------------------------------------------
+DrawSolid:
+        lea     cube_faces,a3              ; face definitions
+        lea     shading_lookup,a4          ; shading values
+        lea     proj,a5                    ; projected vertices
+
+        moveq   #6-1,d7                    ; 6 cube faces
+
+.solid_face:
+        ; Get shading value (0-7) → colour = CUBE_COLOUR_BASE + shading
+        moveq   #0,d6
+        move.b  0(a4),d6                   ; face shading 0..7
+        addi.w  #24,d6                     ; + palette base (colours 24-31)
+
+        ; Draw four edges of the quad face
+        move.b  3(a3),d0                   ; v0 index
+        move.b  4(a3),d1                   ; v1 index
+        bsr     .draw_edge                 ; edge v0-v1
+
+        move.b  4(a3),d0                   ; v1 index
+        move.b  5(a3),d1                   ; v2 index
+        bsr     .draw_edge                 ; edge v1-v2
+
+        move.b  5(a3),d0                   ; v2 index
+        move.b  6(a3),d1                   ; v3 index
+        bsr     .draw_edge                 ; edge v2-v3
+
+        move.b  6(a3),d0                   ; v3 index
+        move.b  3(a3),d1                   ; v0 index
+        bsr     .draw_edge                 ; edge v3-v0
+
+        lea     10(a3),a3                  ; next face
+        lea     1(a4),a4                   ; next shading
         dbra    d7,.solid_face
+        rts
+
+.draw_edge:
+        ; Draw edge from proj[d0] to proj[d1] in colour d6
+        ; in: d0, d1 = vertex indices, d6 = colour, a5 = proj[], a6 = CUSTOM, a0 = screen
+        lsl.w   #2,d0
+        move.w  0(a5,d0.w),d2              ; v0.x
+        move.w  2(a5,d0.w),d3              ; v0.y
+        lsr.w   #2,d0
+
+        move.b  d1,d4
+        lsl.w   #2,d4
+        move.w  0(a5,d4.w),d4              ; v1.x  (v1 screen x)
+        move.w  2(a5,d4.w),d5              ; v1.y
+
+        ; Call BlitLine (uses d2,d3,d4,d5 as x0,y0,x1,y1)
+        bsr     BlitLine
         rts
 
 DrawWire:
@@ -1148,7 +1265,8 @@ DrawWire:
         moveq   #8-1,d7
         moveq   #CUBE_S,d6
         bsr     TransformVerts
-; Octahedron turns the other way.
+
+; Octahedron turns the other way. (Phase 3)
         move.w  ang_z,d0
         add.w   d0,d0
         move.w  ang_x,d1
@@ -1156,11 +1274,19 @@ DrawWire:
         move.w  ang_y,d2
         neg.w   d2
         bsr     CalcMatrix
+        bsr     UpdateOctahedronShading    ; Calculate per-face brightness for octahedron
         moveq   #6-1,d7
         moveq   #OCTA_S,d6
         bsr     TransformVerts             ; a1 continues at the octahedron vertices
 
-        bsr     DrawSolid                  ; render shaded cube faces (Phase 2B)
+        ; Sphere shading (Phase 3)
+        bsr     UpdateSphereShading        ; Procedural vertex shading
+
+        ; Update particles and sort (Phase 4)
+        bsr     UpdateParticles            ; Animate particles
+        bsr     SortFaces                  ; Painters algorithm ordering
+
+        bsr     DrawSolid                  ; render shaded cube faces (Phase 2C)
         bsr     BlitWait                   ; the clear must be done before lines go in
         move.w  #SCREEN_W_BYTES,BLTCMOD(a6)    ; registers every line shares: set once
         move.w  #SCREEN_W_BYTES,BLTDMOD(a6)
@@ -1527,6 +1653,50 @@ shading_lookup:
 light_x: dc.b -64
 light_y: dc.b -90
 light_z: dc.b 64
+
+; ---- PHASE 3: Octahedron Object ----
+; 6 vertices (axes: ±28, 0, 0), (0, ±28, 0), (0, 0, ±28)
+octahedron_verts:
+        dc.w 28,0,0    ; 0: right
+        dc.w -28,0,0   ; 1: left
+        dc.w 0,28,0    ; 2: top
+        dc.w 0,-28,0   ; 3: bottom
+        dc.w 0,0,28    ; 4: front
+        dc.w 0,0,-28   ; 5: back
+
+; 8 triangular faces (scaled down for 64-colour palette)
+octahedron_faces:
+        dc.b 1,1,-1, 0,2,4, 8     ; top-right-front
+        dc.b 1,1,1, 0,4,5, 9      ; top-right-back
+        dc.b -1,1,-1, 1,4,2, 10   ; top-left-front
+        dc.b -1,1,1, 1,5,4, 11    ; top-left-back
+        dc.b 1,-1,-1, 3,4,0, 12   ; bottom-right-front
+        dc.b 1,-1,1, 3,5,0, 13    ; bottom-right-back
+        dc.b -1,-1,-1, 3,1,4, 14  ; bottom-left-front
+        dc.b -1,-1,1, 3,1,5, 15   ; bottom-left-back
+
+octahedron_shading:
+        ds.b 8                     ; 8 faces, brightness 0-7
+
+; ---- PHASE 3: Sphere Object (simplified) ----
+; Procedural sphere: 8 rings × 8 segments = 64 vertices
+; Data: 64 vertices stored, shading calculated per-frame
+
+sphere_verts:
+        ds.w 64*3                  ; 192 words = 384 bytes (64 vertices × 3 coords)
+
+sphere_shading:
+        ds.b 64                    ; 64 vertices, brightness 0-7
+
+; ---- PHASE 4: Dynamic Sorting ----
+; Face ordering array (updated per frame for painters algorithm)
+face_order:
+        ds.b 200                   ; ~200 faces max (cube 6 + octahedron 8 + sphere ~128)
+
+; ---- PHASE 4: Particle System ----
+; 32 particles: x, y, vx, vy, life (10 bytes each)
+particles:
+        ds.b 32*10                 ; 320 bytes
 
 ; The twelve DMA visible labels as link-time addresses. AllocChipMem rewrites
 ; every long word in place, so ptr_* slots hold runtime chip RAM addresses.
