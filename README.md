@@ -32,14 +32,20 @@ bitplane memory while it runs on an emulated 68000. It is not a capture from a r
 
 ## Features
 
-- PAL 320×256 low resolution, 3 bitplanes / 8 colours, Copper-driven display
+- PAL 320×256 low resolution, 4 bitplanes / 16 colours, Copper-driven display, with a different palette
+  loaded by the Copper for the logo band and for the area below it
 - **Wavy logo**: every logo row has its own `BPLCON1` horizontal-scroll move in the Copper list,
   rewritten each frame as a sine wave (the display fetches one extra word per line to allow it)
 - **Copper gradients**: the logo text and its background shade from white through gold to orange
   on every row; the scroller strip has its own gradient and frame lines; one animated bar pulses
   under the logo
 - **Copper bars**: four coloured raster bars glide up and down in the floor below the scroller
-- Two-line **`UBER` / `CRACKING SERVICE` logo**, generated from an embedded font
+- **Pure-graphic 16-colour logo** (`UBER` / `CRACKING SERVICE`): drawn procedurally by `tools/logo_art.py`
+  from stroked line and arc primitives, lit as an embossed bevel with an extrusion shadow, chiselled
+  subtitle and wing ornaments; the face gets a white-to-orange metal gradient from the Copper
+- **Hardware sprite ball ring**: eight shaded balls orbit the wireframe on a tilted, spinning, wobbling 3D
+  ring; they are depth-sorted onto the sprite channels, drawn at three sizes and brightnesses by
+  distance, and the far ones pass behind the playfield (`BPLCON2`)
 - **3D starfield**: 64 stars flying out of the screen with perspective projection, in three depth
   brightnesses (far, mid, near) made from the free bitplane combinations
 - **3D wireframe**: a cube and a counter-rotating octahedron (24 edges), rotated with 7-bit fixed
@@ -94,7 +100,7 @@ separate link step. Other targets:
 | `make verify-repro` | Generate the assets twice and require identical SHA-256 hashes |
 | `make mutants` | Self-test of the validator: inject 33 faults, require each to be reported |
 | `make emutest` | Run the assembled program on an emulated 68000 and check its behaviour |
-| `make emu-mutants` | Self-test of the emulation test: inject 19 faults, require each to fail it (slow) |
+| `make emu-mutants` | Self-test of the emulation test: inject 25 faults, require each to fail it (slow) |
 | `make release` | `clean`, build, reproducibility check, regenerate `MANIFEST.sha256` |
 | `make clean` / `make distclean` | Remove `build/` / also remove the generated assets |
 
