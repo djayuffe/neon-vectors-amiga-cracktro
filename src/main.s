@@ -1052,6 +1052,52 @@ UpdateShading:
         dbra    d7,.face_loop
         rts
 
+; ---------------------------------------------------------------------------
+; PHASE 2B: DrawSolid - Render shaded faces
+;
+; For each cube face: get shading value, project vertices, draw face outline
+; (future: fill with blitter area-fill using shading colour).
+; in: cube_faces, shading_lookup[], proj[]
+; clobbers: d0-d6, a0-a3
+; ---------------------------------------------------------------------------
+DrawSolid:
+        lea     cube_faces,a0              ; face definitions
+        lea     shading_lookup,a1          ; shading values
+        lea     proj,a2                    ; projected vertices
+        moveq   #6-1,d7                    ; 6 faces
+
+.solid_face:
+        ; Get shading value (0-7)
+        move.b  0(a1),d6                   ; face shading
+
+        ; Get vertex indices (v0, v1, v2, v3)
+        move.b  3(a0),d0                   ; v0
+        move.b  4(a0),d1                   ; v1
+        move.b  5(a0),d2                   ; v2
+        move.b  6(a0),d3                   ; v3
+
+        ; Get projected screen coordinates for each vertex
+        ; proj[] stores 2 words per vertex (x, y), 4 bytes apart
+        ; v0 coordinates
+        lsl.w   #2,d0
+        move.w  0(a2,d0.w),d0              ; v0.x
+        move.w  2(a2,d0.w),d1              ; v0.y
+
+        ; v1 coordinates
+        move.b  4(a0),d2                   ; v1 (reload due to d0 usage)
+        lsl.w   #2,d2
+        move.w  0(a2,d2.w),d2              ; v1.x
+        move.w  2(a2,d2.w),d3              ; v1.y
+
+        ; Note: For Phase 2B, we skip actual rendering.
+        ; Future: Draw quad face outline using BlitLine
+        ; Or: Fill quad with blitter area-fill using colour base + shading
+
+        lea     10(a0),a0                  ; next face
+        lea     1(a1),a1                   ; next shading
+        dbra    d7,.solid_face
+        rts
+
 DrawWire:
         lea     CUSTOM,a6
         move.l  ptr_screen,a0
@@ -1114,6 +1160,7 @@ DrawWire:
         moveq   #OCTA_S,d6
         bsr     TransformVerts             ; a1 continues at the octahedron vertices
 
+        bsr     DrawSolid                  ; render shaded cube faces (Phase 2B)
         bsr     BlitWait                   ; the clear must be done before lines go in
         move.w  #SCREEN_W_BYTES,BLTCMOD(a6)    ; registers every line shares: set once
         move.w  #SCREEN_W_BYTES,BLTDMOD(a6)
