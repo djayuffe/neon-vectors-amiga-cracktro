@@ -7,6 +7,7 @@
     python3 tools/gen_tables.py floor_base | bar_colors   # copper-bar floor tables
     python3 tools/gen_tables.py wave_tab                  # BPLCON1 values of the wavy logo
     python3 tools/gen_tables.py palette                   # the logo's 16 colour palette (Copper header)
+    python3 tools/gen_tables.py balls | spr_palette       # hardware sprite ball bitmaps and their colours
 
 The output is deterministic. It is kept as a script (rather than generated at build
 time) so the assembler input stays a single readable file that the validator can parse.
@@ -134,6 +135,69 @@ def wave_tab():
         vals.append(v | (v << 4))
     return vals
 
+# ---- hardware sprite balls --------------------------------------------------------------------
+BALL_SIZES = (16, 12, 8)             # near, mid, far; each drawn centred in a 16 pixel wide sprite
+SPR_PALETTE = [                      # three shades (dark, mid, bright) for each pair of sprites
+    [0xA50, 0xFB3, 0xFFD],           # sprites 0,1: the nearest balls
+    [0x924, 0xE5A, 0xFCE],
+    [0x146, 0x4AF, 0xCEF],
+    [0x113, 0x35A, 0x8BE]]           # sprites 6,7: the farthest balls
+
+def ball_lines(size):
+    """size lines of (plane A word, plane B word): colour = A + 2*B, 0 transparent, shaded like a sphere
+    lit from the top left (1 dark, 2 mid, 3 bright)."""
+    out = []
+    r = size / 2.0
+    L = (-0.5, -0.6, 0.62)
+    n = math.sqrt(sum(c * c for c in L))
+    L = tuple(c / n for c in L)
+    for y in range(size):
+        a = b = 0
+        for x in range(size):
+            dx, dy = (x + 0.5 - r) / r, (y + 0.5 - r) / r
+            d2 = dx * dx + dy * dy
+            col = 0
+            if d2 <= 1.0:
+                nz = math.sqrt(1 - d2)
+                lam = max(0.0, dx * L[0] + dy * L[1] + nz * L[2])
+                col = 3 if lam > 0.78 else 2 if lam > 0.38 else 1
+            bit = 15 - (x + (16 - size) // 2)
+            a |= (col & 1) << bit
+            b |= (col >> 1) << bit
+        out.append((a, b))
+    return out
+
+def balls():
+    vals = []
+    for sz in BALL_SIZES:
+        for a, b in ball_lines(sz):
+            vals += [a, b]
+    return vals
+
+RING_R = 70
+def ring_tab():
+    """256 entries of (x0, z0) = (RING_R * cos, RING_R * sin) >> 7 for the ball ring."""
+    vals = []
+    for k in range(256):
+        c = int(round(127 * math.sin(2 * math.pi * ((k + 64) & 255) / 256)))
+        sn = int(round(127 * math.sin(2 * math.pi * k / 256)))
+        vals += [(RING_R * c) >> 7, (RING_R * sn) >> 7]
+    return vals
+
+def spr_palette_regs():
+    regs = []
+    for pair, cols in enumerate(SPR_PALETTE):
+        for c, v in enumerate(cols):
+            regs.append((16 + 4 * pair + 1 + c, v))
+    return regs
+
+def spr_palette():
+    regs = spr_palette_regs()
+    out = []
+    for i in range(0, len(regs), 4):
+        out.append('        dc.w ' + ','.join('COLOR%02d,$%03X' % r for r in regs[i:i + 4]))
+    return '\n'.join(out)
+
 def words(vals, per=16):
     return '\n'.join('        dc.w ' + ','.join('$%03X' % v for v in vals[i:i + per]) for i in range(0, len(vals), per))
 
@@ -154,4 +218,6 @@ def sintab():
 if __name__ == '__main__':
     print({'copper': copper, 'sintab': sintab, 'recip_star': recip_star, 'recip_wire': recip_wire,
            'floor_base': lambda: words(floor_base()), 'bar_colors': lambda: words(bar_colors(), 8),
-           'wave_tab': lambda: words(wave_tab()), 'palette': header_palette}[sys.argv[1]]())
+           'wave_tab': lambda: words(wave_tab()), 'palette': header_palette,
+           'balls': lambda: words(balls(), 8), 'spr_palette': spr_palette,
+           'ring_tab': lambda: '\n'.join('        dc.w ' + ','.join('%d' % v for v in ring_tab()[i:i + 16]) for i in range(0, 512, 16))}[sys.argv[1]]())

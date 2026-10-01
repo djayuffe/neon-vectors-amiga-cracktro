@@ -456,7 +456,7 @@ class Amiga:
         self.exit_pc = None
         self.in_wfs = False
         self.exit_times = []
-        self.mark_pcs = {self.sym('UpdateStars'): 'stars', self.sym('UpdateScroller'): 'scroller', self.sym('DrawWire'): 'wire'}
+        self.mark_pcs = {self.sym('UpdateSprites'): 'sprites', self.sym('UpdateStars'): 'stars', self.sym('UpdateScroller'): 'scroller', self.sym('DrawWire'): 'wire'}
         self.snapshot = None
         steps = 0
         while True:
@@ -534,7 +534,8 @@ class Amiga:
         for i in range(4):
             ptr[i] = (first.get(0xE0 + 4 * i, 0) << 16) | first.get(0xE2 + 4 * i, 0)
         out['ptr'] = ptr
-        pal = {i: 0 for i in range(16)}
+        out['spr_ptr'] = [(first.get(0x120 + 4 * i, 0) << 16) | first.get(0x122 + 4 * i, 0) for i in range(8)]
+        pal = {i: 0 for i in range(32)}
         evs = sorted(ev, key=lambda e: e[0])
         pending = list(evs)
         pal_by_line, bplcon1_by_line = {}, {}
@@ -542,7 +543,7 @@ class Amiga:
         for y in range(FRAME_LINES):
             while pending and pending[0][0] <= y:
                 _, r, v = pending.pop(0)
-                if 0x180 <= r < 0x1A0:
+                if 0x180 <= r < 0x1C0:
                     cur[(r - 0x180) // 2] = v
                 elif r == 0x102:
                     scroll = v
@@ -580,6 +581,21 @@ class Amiga:
             planes_px.append(rowpix)
             pal_l = pal_by_line[y]
             img.append([pal_l[v] for v in rowpix])
+        # hardware sprites over the playfield (sprite 0 in front); colour 0 is transparent
+        for n in range(7, -1, -1):
+            a_ = out['spr_ptr'][n]
+            pos, ctl = mem.r16(a_), mem.r16(a_ + 2)
+            vstart, vstop = (pos >> 8) | ((ctl & 4) << 6), (ctl >> 8) | ((ctl & 2) << 7)
+            hstart = ((pos & 255) << 1) | (ctl & 1)
+            for ln in range(max(0, vstop - vstart)):
+                wa, wb = mem.r16(a_ + 4 + ln * 4), mem.r16(a_ + 6 + ln * 4)
+                row = vstart + ln - 44
+                for bit in range(16):
+                    c = ((wa >> (15 - bit)) & 1) | (((wb >> (15 - bit)) & 1) << 1)
+                    x = hstart - 0x81 + bit
+                    if c and 0 <= x < 320 and 0 <= row < len(img):
+                        img[row][x] = pal_by_line[vstart + ln][16 + 4 * (n // 2) + c]
+        out['spr_pages'] = [mem.r_block(out['spr_ptr'][n], 80) for n in range(8)]
         out['px'] = planes_px
         out['img'] = img
         out['planes'] = [mem.r_block(ptr[p] + 2, 10240) for p in range(4)]
@@ -695,6 +711,43 @@ def ref_wire(k, verts, edges, consts):
     for i, j in edges:
         pix.update(ref_bresenham(proj[i][0], proj[i][1], proj[j][0], proj[j][1]))
     return pix, proj
+
+
+def ref_ring(f, wire_cx, consts):
+    """The eight sprite buffers (position words, bitmap lines, terminator) for frame f."""
+    RING_R, TILT, ZOFF, MIDCY, NEAR, MID, D = consts
+    tab = [int(round(127 * math.sin(2 * math.pi * i / 256))) for i in range(256)]
+    sin = lambda a: tab[a & 255]
+    cos = lambda a: tab[(a + 64) & 255]
+    tilt = TILT + (sin(2 * f) >> 4)
+    st, ct, sr, cr = sin(tilt), cos(tilt), sin(f), cos(f)
+    A, B, C, Dm, F = cr, (st * sr) >> 7, sr, -((st * cr) >> 7), ct
+    balls = []
+    for i in range(8):
+        th = 3 * f + 32 * i
+        x0 = (RING_R * cos(th)) >> 7
+        z0 = (RING_R * sin(th)) >> 7
+        xx = (x0 * A + z0 * B) >> 7
+        yy = (x0 * C + z0 * Dm) >> 7
+        zz = (z0 * F) >> 7
+        zc = zz + ZOFF
+        r = int(round(D * 256 / zc))
+        balls.append((zc, ((xx * r) >> 8) + wire_cx, ((yy * r) >> 8) + MIDCY))
+    order = sorted(range(8), key=lambda i: (balls[i][0], i))     # stable: nearest first
+    bufs = []
+    for rank, bi in enumerate(order):
+        zc, sx, sy = balls[bi]
+        size = 16 if zc < NEAR else 12 if zc < MID else 8
+        v0 = 44 + sy - size // 2
+        v1 = v0 + size
+        h = sx + 0x81 - 8
+        pos = ((v0 & 255) << 8) | ((h >> 1) & 255)
+        ctl = ((v1 & 255) << 8) | (((v0 >> 8) & 1) << 2) | (((v1 >> 8) & 1) << 1) | (h & 1)
+        data = struct.pack('>HH', pos, ctl)
+        for a, b in gen_tables.ball_lines(size):
+            data += struct.pack('>HH', a, b)
+        bufs.append(data + bytes(4))
+    return bufs
 
 
 def png(path, w, h, rows):
@@ -818,12 +871,13 @@ def main():
     # starts at display line 244. `scroller` is entered when the stars are done and `wire`
     # when the scroller is done; both times are measured from the moment the loop left the
     # frame-sync wait, converted to the beam line it was at.
-    logo_slack = []
+    logo_slack, spr_slack = [], []
     star_slack, scr_slack = [], []
     for i, t0 in enumerate(a.exit_times[:len(a.t_marks.get('wire', []))]):
         line0 = (t0 // LINE_CYCLES) % FRAME_LINES
         lines_to = lambda target: ((FRAME_LINES - line0) + target) * LINE_CYCLES
-        logo_slack.append(lines_to(44 + 8) - (a.t_marks['stars'][i] - t0))
+        logo_slack.append(lines_to(44 + 8) - (a.t_marks['sprites'][i] - t0))
+        spr_slack.append(lines_to(44 + 56) - (a.t_marks['stars'][i] - t0))
         star_slack.append(lines_to(44 + 76) - (a.t_marks['scroller'][i] - t0))
         scr_slack.append(lines_to(44 + 200) - (a.t_marks['wire'][i] - t0))
     ts = [m - e for m, e in zip(a.t_marks['scroller'], a.exit_times)]
@@ -831,8 +885,9 @@ def main():
     tall = [t1 - t0 for t0, t1 in zip(a.exit_times, fm[1:])]
     print('  cost split (avg cycles): mod+raster+stars %d, scroller %d, wireframe+rest %d'
           % (sum(ts) // len(ts), sum(tw) // len(tw), sum(tall[:len(ts)]) // len(ts) - sum(ts) // len(ts) - sum(tw) // len(tw)))
-    print('  wave+bars finish %d cycles before the beam reaches the logo; stars %d before the starfield; scroller %d before its strip (worst frame)'
-          % (min(logo_slack), min(star_slack), min(scr_slack)))
+    print('  wave+bars finish %d cycles before the beam reaches the logo; sprites %d before the ring; stars %d before the starfield; scroller %d before its strip (worst frame)'
+          % (min(logo_slack), min(spr_slack), min(star_slack), min(scr_slack)))
+    check(min(spr_slack) > 0, 'the sprite buffers are still being rewritten when the beam reaches the ring (%d cycles late)' % -min(spr_slack))
     check(min(logo_slack) > 0, 'the wave and bar rows are still being rewritten when the beam reaches the logo (%d cycles late)' % -min(logo_slack))
     check(min(star_slack) > 0, 'stars are still being drawn when the beam reaches the starfield band (flicker/tearing)')
     check(min(scr_slack) > 0, 'the scroller is still being shifted when the beam reaches its strip (tearing)')
@@ -899,7 +954,7 @@ def main():
     if not check(sn is not None, 'no frame snapshot was taken'):
         finish(); return
     check(sn['terminated'], 'Copper list does not end with $FFFF,$FFFE')
-    check((sn['dmacon'] & 0x3C0) == 0x3C0, 'master, bitplane, Copper and blitter DMA are not all enabled (DMACON=$%04X)' % sn['dmacon'])
+    check((sn['dmacon'] & 0x3E0) == 0x3E0, 'master, bitplane, Copper, blitter and sprite DMA are not all enabled (DMACON=$%04X)' % sn['dmacon'])
     check(all(l[3] >= 1 and l[2] != 0 for l in a.latches), 'a channel was started with no sample loaded (Paula would play noise): %s' % [l for l in a.latches if l[3] < 1 or l[2] == 0][:2])
     check(sn['diw'] == (0x2C, 0x12C), 'display window lines %s, expected (44, 300)' % (sn['diw'],))
     scr = mem.r32(a.sym('reloc_table') + 0)
@@ -969,6 +1024,25 @@ def main():
     check(all(pbl[44 + 100][k] == gen_tables.MID_PALETTE[k] for k in range(1, 16)), 'the middle band palette is not loaded below the logo')
     check(pbl[44 + 100][1] == 0xAAD, 'middle band mid-star colour is $%03X, expected $AAD' % pbl[44 + 100][1])
     check(all(pbl[44 + 100][i] == 0x3FC for i in (2, 3, 6, 7)), 'wireframe colours (2, 3, 6, 7) differ')
+    # ---- sprite ring: the eight buffers exactly, and the sprite palette
+    sin_tab = [int(round(127 * math.sin(2 * math.pi * i / 256))) for i in range(256)]
+    prev_cx = equ('MID_CX') + ((sin_tab[(n - 2) & 255] * equ('WIRE_SWAY')) >> 7) if n >= 2 else equ('MID_CX')
+    ring = ref_ring(n - 1, prev_cx, (equ('RING_R'), equ('RING_TILT'), equ('WIRE_ZOFF'), equ('MID_CY'), equ('BALL_NEAR'), equ('BALL_MID'), equ('WIRE_D')))
+    ring_bad = []
+    for r_, want_ in enumerate(ring):
+        got_ = sn['spr_pages'][r_][:len(want_)]
+        if got_ != want_:
+            ring_bad.append((r_, got_[:4].hex(), want_[:4].hex()))
+    check(not ring_bad, 'sprite ring buffers differ on %d of 8 sprites; first (rank, got header, want header): %s' % (len(ring_bad), ring_bad[:2]))
+    spr_base = mem.r32(a.sym('reloc_table') + 40)
+    page_ok = True
+    for r_, want_ in enumerate(ring):
+        size = (len(want_) - 8) // 4
+        cls = {16: 0, 12: 1, 8: 2}[size]
+        if sn['spr_ptr'][r_] != spr_base + (r_ * 3 + cls) * equ('SPR_BYTES'):
+            page_ok = False
+    check(page_ok, 'a sprite pointer does not address the prebuilt page for its rank and ball size')
+    check(all(pbl[44 + 2][c] == v for c, v in gen_tables.spr_palette_regs()), 'the sprite palette is not loaded by the Copper header')
     # ---- wavy logo: BPLCON1 per row, and the logo as actually displayed
     px = sn['px']
     f = n - 1                                          # frame_no after n-1 completed iterations

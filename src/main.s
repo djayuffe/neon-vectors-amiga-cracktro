@@ -19,11 +19,19 @@ MID_CY          EQU 136
 SCROLL_Y        EQU 200     ; 16 line scroller strip
 SCROLL_H        EQU 16
 
+NBALLS          EQU 8       ; hardware sprite ring
+SPR_BYTES       EQU 80      ; per page: header 4 + up to 16 lines of 4 + terminator 4, rounded
+SPR_PAGES       EQU NBALLS*3 ; one prebuilt page per sprite and ball size
+RING_R          EQU 70
+RING_TILT       EQU 40      ; tilt of the ring plane (256 = a full turn)
+BALL_NEAR       EQU 285     ; distance below which a ball is drawn big (16 px)
+BALL_MID        EQU 325     ; ... medium (12 px) below this, else small (8 px)
+
 FLOOR_H         EQU 34      ; copper-bar floor rows (222..255)
 NBARS           EQU 4
 
 ; Starfield: NSTARS points with (x, y, z); z runs from ZMAX down to ZMIN and wraps.
-NSTARS          EQU 56
+NSTARS          EQU 48
 STAR_SIZE       EQU 10      ; x.w y.w z.w offset.w mask.b class.b
 ZMIN            EQU 32
 ZRANGE          EQU 224
@@ -35,6 +43,8 @@ PROJ_F          EQU 128     ; star projection scale
 ; Wireframe: 7-bit sine table, perspective D/(z+ZOFF).
 WIRE_D          EQU 220
 WIRE_ZOFF       EQU 300
+CUBE_S          EQU 42      ; cube vertices are (+-42, +-42, +-42)
+OCTA_S          EQU 28      ; octahedron vertices are (+-28,0,0), (0,+-28,0), (0,0,+-28)
 WIRE_SWAY       EQU 64      ; sideways swing, pixels
 WIRE_ZOOM       EQU 18      ; breathing, distance units
 
@@ -51,6 +61,8 @@ ptr_cop_bpl1 equ reloc_table+24
 ptr_raster   equ reloc_table+28
 ptr_wave     equ reloc_table+32
 ptr_bars     equ reloc_table+36
+ptr_sprites  equ reloc_table+40
+ptr_cop_spr  equ reloc_table+44
 
         section code,code
         xdef    _start
@@ -113,15 +125,16 @@ _start:
         bsr     DrawLogo
         bsr     InitStars
         bsr     PatchCopper
+        bsr     InitSprites
         bsr     MOD_Init
 
         move.l  ptr_copper,d0
         move.l  d0,COP1LCH(a6)
         move.w  #0,COPJMP1(a6)
-; Blitter DMA is on for the wireframe. Audio DMA stays off here: a channel enabled before MOD_Row has loaded its
+; Blitter and sprite DMA are on for the wireframe and the ball ring. Audio DMA stays off here: a channel enabled before MOD_Row has loaded its
 ; location and length would play 128 KB of arbitrary memory as noise. Each
 ; channel is switched on by its first note.
-        move.w  #(DMAF_SETCLR|DMAF_MASTER|DMAF_RASTER|DMAF_COPPER|DMAF_BLITTER),DMACON(a6)
+        move.w  #(DMAF_SETCLR|DMAF_MASTER|DMAF_RASTER|DMAF_COPPER|DMAF_BLITTER|DMAF_SPRITE),DMACON(a6)
 
 ; --- main loop --------------------------------------------------------------
 ; One iteration per PAL frame: WaitFrameSync returns as the beam leaves the
@@ -133,6 +146,7 @@ _start:
         addq.w  #1,frame_no
         bsr     UpdateWave                 ; Copper rows above the beam first
         bsr     UpdateBars
+        bsr     UpdateSprites              ; also before the beam reaches the ring
         bsr     UpdateRaster
         bsr     UpdateStars
         bsr     UpdateScroller
@@ -723,6 +737,255 @@ UpdateScroller:
         rts
 
 ; ---------------------------------------------------------------------------
+; Hardware sprite ring: eight shaded balls on a tilted ring that spins, rolls and
+; wobbles in 3D around the wireframe. The sprite hardware draws them; the CPU only
+; rewrites each sprite's small buffer (position words and a 16 line bitmap) once a
+; frame, early, before the beam reaches the ring.
+;
+; Per ball: a point on the ring is rotated by the tilt (about x) and roll (about z),
+; so with y = 0 the 3x3 matrix needs only five coefficients:
+;     x'' = (x0*A + z0*B) >> 7      A = cos(roll)            B = sin(tilt)*sin(roll) >> 7
+;     y'' = (x0*C + z0*D) >> 7      C = sin(roll)            D = -(sin(tilt)*cos(roll) >> 7)
+;     z'' = (z0*F) >> 7             F = cos(tilt)
+; and projected with the reciprocal table. Balls are sorted by distance and the nearest
+; get the lowest sprite numbers (the sprite hardware puts a lower number in front), which
+; also gives them the brightest sprite-pair palette. Size (16/12/8 pixels) follows distance.
+; ---------------------------------------------------------------------------
+; Every sprite gets three prebuilt pages (one per ball size): position words, the shaded
+; ball bitmap, and the end-of-sprite zero long. Per frame only the header words of the
+; chosen page and the sprite's Copper pointer change, so no bitmap is ever copied.
+InitSprites:
+        move.l  ptr_sprites,a1
+        moveq   #NBALLS-1,d7
+.sprite:
+        lea     ball_bitmaps,a2
+        moveq   #16,d2
+        bsr     .page
+        lea     64+ball_bitmaps,a2
+        moveq   #12,d2
+        bsr     .page
+        lea     112+ball_bitmaps,a2
+        moveq   #8,d2
+        bsr     .page
+        dbra    d7,.sprite
+        rts
+.page:                                     ; a1 = page, a2 = bitmap, d2 = lines; a1 advances one page
+        move.l  a1,a3
+        clr.l   (a3)+                      ; header, set per frame
+        move.w  d2,d0
+        subq.w  #1,d0
+.l:
+        move.l  (a2)+,(a3)+
+        dbra    d0,.l
+        clr.l   (a3)                       ; terminator
+        lea     SPR_BYTES(a1),a1
+        rts
+
+; in: d0 = angle; a4 = sintab. out: d1 = sin, d2 = cos (scaled by 127)
+SinCos:
+        andi.w  #255,d0
+        add.w   d0,d0
+        move.w  0(a4,d0.w),d1
+        addi.w  #128,d0
+        andi.w  #511,d0
+        move.w  0(a4,d0.w),d2
+        rts
+
+UpdateSprites:
+        lea     sintab,a4
+        move.w  frame_no,d0
+        add.w   d0,d0                      ; the tilt wobbles with 2 * frame
+        bsr     SinCos
+        asr.w   #4,d1
+        addi.w  #RING_TILT,d1
+        move.w  d1,d0                      ; tilt angle
+        bsr     SinCos
+        move.w  d1,r_stilt
+        move.w  d2,r_ctilt
+        move.w  frame_no,d0                ; roll = frame
+        bsr     SinCos
+        move.w  d1,r_sroll
+        move.w  d2,r_croll
+; coefficients
+        move.w  r_croll,r_a
+        move.w  r_stilt,d0
+        muls    r_sroll,d0
+        asr.l   #7,d0
+        move.w  d0,r_b
+        move.w  r_sroll,r_c
+        move.w  r_stilt,d0
+        muls    r_croll,d0
+        asr.l   #7,d0
+        neg.w   d0
+        move.w  d0,r_d
+        move.w  r_ctilt,r_f
+; the balls
+        lea     ball_zc,a1
+        lea     ball_sx,a2
+        lea     ball_sy,a3
+        lea     recip_wire,a5
+        moveq   #0,d7                      ; ball number
+.ball:
+        move.w  frame_no,d0
+        move.w  d0,d1
+        add.w   d1,d1
+        add.w   d1,d0                      ; 3 * frame: the spin
+        move.w  d7,d1
+        lsl.w   #5,d1                      ; 32 steps between balls
+        add.w   d1,d0
+        andi.w  #255,d0
+        lsl.w   #2,d0
+        lea     ring_tab,a0
+        move.w  0(a0,d0.w),d2              ; x0 = RING_R * cos >> 7
+        move.w  2(a0,d0.w),d1              ; z0 = RING_R * sin >> 7
+        move.w  d2,d3
+        muls    r_a,d3
+        move.w  d1,d4
+        muls    r_b,d4
+        add.l   d4,d3
+        asr.l   #7,d3                      ; x''
+        move.w  d2,d4
+        muls    r_c,d4
+        move.w  d1,d5
+        muls    r_d,d5
+        add.l   d5,d4
+        asr.l   #7,d4                      ; y''
+        muls    r_f,d1
+        asr.l   #7,d1                      ; z''
+        addi.w  #WIRE_ZOFF,d1              ; distance
+        move.w  d1,(a1)+
+        add.w   d1,d1
+        move.w  0(a5,d1.w),d1              ; D*256/distance
+        muls    d1,d3
+        asr.l   #8,d3
+        add.w   wire_cx,d3
+        move.w  d3,(a2)+                   ; screen x
+        muls    d1,d4
+        asr.l   #8,d4
+        addi.w  #MID_CY,d4
+        move.w  d4,(a3)+                   ; screen y
+        addq.w  #1,d7
+        cmp.w   #NBALLS,d7
+        blo     .ball
+; stable insertion sort of the ball numbers by distance, nearest first
+        lea     ball_order,a1
+        moveq   #0,d0
+.init:
+        move.w  d0,(a1)+
+        addq.w  #1,d0
+        cmp.w   #NBALLS,d0
+        blo     .init
+        lea     ball_order,a1
+        lea     ball_zc,a2
+        moveq   #1,d6                      ; j
+.sj:
+        move.w  d6,d0
+        add.w   d0,d0
+        move.w  0(a1,d0.w),d4              ; key = order[j]
+        move.w  d4,d0
+        add.w   d0,d0
+        move.w  0(a2,d0.w),d5              ; its distance
+        move.w  d6,d3                      ; insertion position
+.si:
+        tst.w   d3
+        beq     .place
+        move.w  d3,d0
+        subq.w  #1,d0
+        add.w   d0,d0                      ; byte offset of order[position-1]
+        move.w  0(a1,d0.w),d1
+        add.w   d1,d1
+        move.w  0(a2,d1.w),d2              ; distance of that ball
+        cmp.w   d5,d2
+        ble     .place                     ; not further than the key: stable, stop
+        move.w  0(a1,d0.w),2(a1,d0.w)      ; shift it up
+        subq.w  #1,d3
+        bra     .si
+.place:
+        move.w  d3,d0
+        add.w   d0,d0
+        move.w  d4,0(a1,d0.w)
+        addq.w  #1,d6
+        cmp.w   #NBALLS,d6
+        blo     .sj
+; write the sprites, rank 0 = nearest = sprite 0
+        moveq   #0,d7
+.wr:
+        move.w  d7,d0
+        add.w   d0,d0
+        lea     ball_order,a1
+        move.w  0(a1,d0.w),d6              ; ball number
+        move.w  d6,d0
+        add.w   d0,d0
+        lea     ball_zc,a1
+        move.w  0(a1,d0.w),d3              ; distance
+        lea     ball_sx,a1
+        move.w  0(a1,d0.w),d4              ; screen x
+        lea     ball_sy,a1
+        move.w  0(a1,d0.w),d5              ; screen y
+        moveq   #16,d2
+        moveq   #0,d6                      ; size class
+        cmp.w   #BALL_NEAR,d3
+        blt     .sized
+        moveq   #12,d2
+        moveq   #1,d6
+        cmp.w   #BALL_MID,d3
+        blt     .sized
+        moveq   #8,d2
+        moveq   #2,d6
+.sized:
+        move.w  d5,d0
+        addi.w  #44,d0                     ; display line of the ball's centre
+        move.w  d2,d1
+        lsr.w   #1,d1
+        sub.w   d1,d0                      ; VSTART
+        move.w  d0,d1
+        add.w   d2,d1                      ; VSTOP
+        move.w  d4,d3
+        addi.w  #$81-8,d3                  ; HSTART: $81 is the window's left edge, minus half the sprite
+        move.w  d0,d4
+        andi.w  #255,d4
+        lsl.w   #8,d4
+        move.w  d3,d5
+        lsr.w   #1,d5
+        andi.w  #255,d5
+        or.w    d5,d4                      ; SPRxPOS
+        move.w  d1,d5
+        andi.w  #255,d5
+        lsl.w   #8,d5
+        btst    #8,d0
+        beq     .v0
+        ori.w   #4,d5
+.v0:
+        btst    #8,d1
+        beq     .v1
+        ori.w   #2,d5
+.v1:
+        andi.w  #1,d3
+        or.w    d3,d5                      ; SPRxCTL
+; page = sprites + (rank * 3 + size class) * SPR_BYTES, class 0 = 16 px, 1 = 12, 2 = 8
+        move.w  d7,d0
+        add.w   d0,d0
+        add.w   d7,d0                      ; rank * 3
+        add.w   d6,d0                      ; + size class
+        mulu    #SPR_BYTES,d0
+        move.l  ptr_sprites,a1
+        adda.l  d0,a1
+        move.w  d4,(a1)
+        move.w  d5,2(a1)                   ; header words
+        move.l  ptr_cop_spr,a2             ; point this sprite's Copper pointer pair at the page
+        move.w  d7,d0
+        lsl.w   #3,d0
+        adda.w  d0,a2
+        move.l  a1,d0
+        move.w  d0,6(a2)
+        swap    d0
+        move.w  d0,2(a2)
+        addq.w  #1,d7
+        cmp.w   #NBALLS,d7
+        blo     .wr
+        rts
+
+; ---------------------------------------------------------------------------
 ; Wireframe. A cube (objects' vertices 0..7) and an octahedron (8..13) rotate in
 ; opposite directions. Each frame: the hidden buffer's band is cleared by the
 ; blitter while the CPU builds the rotation matrices and projects the vertices,
@@ -783,6 +1046,7 @@ DrawWire:
         bsr     CalcMatrix
         lea     verts,a1
         moveq   #8-1,d7
+        moveq   #CUBE_S,d6
         bsr     TransformVerts
 ; Octahedron turns the other way.
         move.w  ang_z,d0
@@ -793,6 +1057,7 @@ DrawWire:
         neg.w   d2
         bsr     CalcMatrix
         moveq   #6-1,d7
+        moveq   #OCTA_S,d6
         bsr     TransformVerts             ; a1 continues at the octahedron vertices
 
         bsr     BlitWait                   ; the clear must be done before lines go in
@@ -925,43 +1190,76 @@ CalcMatrix:
         move.w  d0,16(a2)
         rts
 
-; in: a1 = vertices (x.w, y.w, z.w), d7 = count - 1, a3 = output (x.w, y.w) pairs
-; Rotates by `mat`, then projects: screen = centre + r * WIRE_D / (z + WIRE_ZOFF), using a
-; reciprocal table instead of a division. Clobbers a2 and a4.
-; a1 and a3 are left pointing after the last vertex, so objects can be chained.
+; in: a1 = vertices (x.w, y.w, z.w), d7 = count - 1, d6 = coordinate magnitude, a3 = output
+; Vertex coordinates are 0 or +-d6 (cube +-42, octahedron +-28), so the rotation needs no
+; multiplication per vertex: the nine products matrix * d6 are formed once and a vertex
+; is the sum of +-columns. The result equals the full matrix product exactly. Then the
+; perspective projection: screen = centre + r * WIRE_D / (z + wire_zoff) via a reciprocal
+; table. a1 and a3 are left after the last vertex so objects can be chained.
+; Clobbers d0-d6, a2, a4, a5.
 TransformVerts:
         lea     mat,a2
+        lea     tcol,a5
+        moveq   #0,d0                      ; column
+.col:
+        move.w  0(a2),d1                   ; the three rows of column d0: mat[row*3+col]
+        muls    d6,d1
+        move.l  d1,0(a5)
+        move.w  6(a2),d1
+        muls    d6,d1
+        move.l  d1,4(a5)
+        move.w  12(a2),d1
+        muls    d6,d1
+        move.l  d1,8(a5)
+        addq.l  #2,a2
+        lea     12(a5),a5
+        addq.w  #1,d0
+        cmp.w   #3,d0
+        blo     .col
         lea     recip_wire,a4
+        lea     tcol,a5
 .tv:
+        moveq   #0,d3                      ; x'
+        moveq   #0,d4                      ; y'
+        moveq   #0,d5                      ; z'
         move.w  (a1)+,d0
-        move.w  (a1)+,d1
-        move.w  (a1)+,d2
-        move.w  d0,d3
-        muls    (a2),d3
-        move.w  d1,d4
-        muls    2(a2),d4
-        add.l   d4,d3
-        move.w  d2,d4
-        muls    4(a2),d4
-        add.l   d4,d3
+        beq     .nx
+        bmi     .mx
+        add.l   0(a5),d3
+        add.l   4(a5),d4
+        add.l   8(a5),d5
+        bra     .nx
+.mx:
+        sub.l   0(a5),d3
+        sub.l   4(a5),d4
+        sub.l   8(a5),d5
+.nx:
+        move.w  (a1)+,d0
+        beq     .ny
+        bmi     .my
+        add.l   12(a5),d3
+        add.l   16(a5),d4
+        add.l   20(a5),d5
+        bra     .ny
+.my:
+        sub.l   12(a5),d3
+        sub.l   16(a5),d4
+        sub.l   20(a5),d5
+.ny:
+        move.w  (a1)+,d0
+        beq     .nz
+        bmi     .mz
+        add.l   24(a5),d3
+        add.l   28(a5),d4
+        add.l   32(a5),d5
+        bra     .nz
+.mz:
+        sub.l   24(a5),d3
+        sub.l   28(a5),d4
+        sub.l   32(a5),d5
+.nz:
         asr.l   #7,d3                      ; rotated x
-        move.w  d0,d4
-        muls    6(a2),d4
-        move.w  d1,d5
-        muls    8(a2),d5
-        add.l   d5,d4
-        move.w  d2,d5
-        muls    10(a2),d5
-        add.l   d5,d4
         asr.l   #7,d4                      ; rotated y
-        move.w  d0,d5
-        muls    12(a2),d5
-        move.w  d1,d6
-        muls    14(a2),d6
-        add.l   d6,d5
-        move.w  d2,d6
-        muls    16(a2),d6
-        add.l   d6,d5
         asr.l   #7,d5                      ; rotated z
         add.w   wire_zoff,d5               ; distance from the eye
         add.w   d5,d5
@@ -1066,6 +1364,19 @@ gfx_base:    dc.l 0
 chip_base:   dc.l 0
 scroll_ptr:  dc.l scroll_text
 rng_seed:    dc.w 1
+r_stilt:     dc.w 0             ; ball ring: sin/cos of the tilt and roll, and the matrix coefficients
+r_ctilt:     dc.w 0
+r_sroll:     dc.w 0
+r_croll:     dc.w 0
+r_a:         dc.w 0
+r_b:         dc.w 0
+r_c:         dc.w 0
+r_d:         dc.w 0
+r_f:         dc.w 0
+ball_zc:     ds.w NBALLS        ; per ball: distance, screen x, screen y
+ball_sx:     ds.w NBALLS
+ball_sy:     ds.w NBALLS
+ball_order:  ds.w NBALLS        ; ball numbers, nearest first
 frame_no:    dc.w 0
 wire_cx:     dc.w MID_CX
 wire_zoff:   dc.w WIRE_ZOFF
@@ -1080,16 +1391,17 @@ cy:          dc.w 0
 sz:          dc.w 0
 cz:          dc.w 0
 mat:         ds.w 9             ; 3x3 rotation matrix, scaled by 128
+tcol:        ds.l 9             ; matrix * vertex magnitude, by column
 proj:        ds.w 14*2          ; projected (x, y) of the 14 wireframe vertices
 stars:       ds.b NSTARS*STAR_SIZE
 
-; The ten DMA visible labels as link-time addresses. AllocChipMem rewrites
+; The twelve DMA visible labels as link-time addresses. AllocChipMem rewrites
 ; every long word in place, so ptr_* slots hold runtime chip RAM addresses.
         even
 reloc_table:
         dc.l screen,logo_data,font_data,audio_silence,mod_data,copper,cop_bpl1,cop_raster_color
-        dc.l cop_wave,cop_bars
-RELOC_COUNT     EQU 10
+        dc.l cop_wave,cop_bars,sprites,cop_spr
+RELOC_COUNT     EQU 12
 
 gfx_name:    dc.b "graphics.library",0
         even
@@ -1124,6 +1436,53 @@ edges:
         dc.b 9,10, 9,11, 9,12, 9,13
         dc.b 10,12, 10,13, 11,12, 11,13
 edges_end:
+
+; (x0, z0) of the ball ring for every angle (tools/gen_tables.py ring_tab).
+ring_tab:
+        dc.w 69,0,69,1,69,3,69,4,68,6,68,8,68,10,68,12
+        dc.w 68,13,67,15,67,16,66,18,66,20,66,21,65,23,64,25
+        dc.w 63,26,63,27,62,29,61,31,61,32,60,34,59,35,58,37
+        dc.w 57,38,56,39,55,41,54,42,53,44,52,45,51,46,50,48
+        dc.w 49,49,48,50,46,51,45,52,44,53,42,54,41,55,39,56
+        dc.w 38,57,37,58,35,59,34,60,32,61,31,61,29,62,27,63
+        dc.w 26,63,25,64,23,65,21,66,20,66,18,66,16,67,15,67
+        dc.w 13,68,12,68,10,68,8,68,6,68,4,69,3,69,1,69
+        dc.w 0,69,-2,69,-4,69,-5,69,-7,68,-9,68,-11,68,-13,68
+        dc.w -14,68,-16,67,-17,67,-19,66,-21,66,-22,66,-24,65,-26,64
+        dc.w -27,63,-28,63,-30,62,-32,61,-33,61,-35,60,-36,59,-38,58
+        dc.w -39,57,-40,56,-42,55,-43,54,-45,53,-46,52,-47,51,-49,50
+        dc.w -50,49,-51,48,-52,46,-53,45,-54,44,-55,42,-56,41,-57,39
+        dc.w -58,38,-59,37,-60,35,-61,34,-62,32,-62,31,-63,29,-64,27
+        dc.w -64,26,-65,25,-66,23,-67,21,-67,20,-67,18,-68,16,-68,15
+        dc.w -69,13,-69,12,-69,10,-69,8,-69,6,-70,4,-70,3,-70,1
+        dc.w -70,0,-70,-2,-70,-4,-70,-5,-69,-7,-69,-9,-69,-11,-69,-13
+        dc.w -69,-14,-68,-16,-68,-17,-67,-19,-67,-21,-67,-22,-66,-24,-65,-26
+        dc.w -64,-27,-64,-28,-63,-30,-62,-32,-62,-33,-61,-35,-60,-36,-59,-38
+        dc.w -58,-39,-57,-40,-56,-42,-55,-43,-54,-45,-53,-46,-52,-47,-51,-49
+        dc.w -50,-50,-49,-51,-47,-52,-46,-53,-45,-54,-43,-55,-42,-56,-40,-57
+        dc.w -39,-58,-38,-59,-36,-60,-35,-61,-33,-62,-32,-62,-30,-63,-28,-64
+        dc.w -27,-64,-26,-65,-24,-66,-22,-67,-21,-67,-19,-67,-17,-68,-16,-68
+        dc.w -14,-69,-13,-69,-11,-69,-9,-69,-7,-69,-5,-70,-4,-70,-2,-70
+        dc.w 0,-70,1,-70,3,-70,4,-70,6,-69,8,-69,10,-69,12,-69
+        dc.w 13,-69,15,-68,16,-68,18,-67,20,-67,21,-67,23,-66,25,-65
+        dc.w 26,-64,27,-64,29,-63,31,-62,32,-62,34,-61,35,-60,37,-59
+        dc.w 38,-58,39,-57,41,-56,42,-55,44,-54,45,-53,46,-52,48,-51
+        dc.w 49,-50,50,-49,51,-47,52,-46,53,-45,54,-43,55,-42,56,-40
+        dc.w 57,-39,58,-38,59,-36,60,-35,61,-33,61,-32,62,-30,63,-28
+        dc.w 63,-27,64,-26,65,-24,66,-22,66,-21,66,-19,67,-17,67,-16
+        dc.w 68,-14,68,-13,68,-11,68,-9,68,-7,69,-5,69,-4,69,-2
+
+; Hardware sprite balls: 16, 12 and 8 line bitmaps (planes A, B per line), tools/gen_tables.py balls.
+ball_bitmaps:
+        dc.w $700,$7E0,$1F88,$1FF0,$3F84,$3FF8,$7F86,$7FF8
+        dc.w $7F86,$7FF8,$7F07,$FFF8,$7E0F,$FFF0,$7C1F,$FFE0
+        dc.w $01F,$FFE0,$03F,$FFC0,$80FF,$7F00,$3FE,$7C00
+        dc.w $7FFE,$000,$3FFC,$000,$1FF8,$000,$7E0,$000
+        dc.w $300,$3C0,$F90,$FE0,$1F88,$1FF0,$1F08,$1FF0
+        dc.w $3F1C,$3FE0,$1C1C,$3FE0,$03C,$3FC0,$07C,$3F80
+        dc.w $1F8,$1E00,$1FF8,$000,$FF0,$000,$3C0,$000
+        dc.w $300,$3C0,$7A0,$7C0,$F30,$FC0,$E30,$FC0
+        dc.w $070,$F80,$0F0,$F00,$7E0,$000,$3C0,$000
 
 ; Wavy logo values (tools/gen_tables.py wave_tab).
 wave_tab:
@@ -1253,6 +1612,21 @@ cop_bpl1:
         dc.w COLOR04,$FC4,COLOR05,$FE9,COLOR06,$FFC,COLOR07,$FFF
         dc.w COLOR08,$424,COLOR09,$212,COLOR10,$246,COLOR11,$468
         dc.w COLOR12,$6AC,COLOR13,$ADF,COLOR14,$D42,COLOR15,$FFF
+; Hardware sprites: eight pointer pairs (the Copper reloads them every frame; PatchSprites
+; fills in the runtime addresses once) and the colours of the four sprite pairs.
+cop_spr:
+        dc.w SPR0PTH,0,SPR0PTL,0
+        dc.w SPR1PTH,0,SPR1PTL,0
+        dc.w SPR2PTH,0,SPR2PTL,0
+        dc.w SPR3PTH,0,SPR3PTL,0
+        dc.w SPR4PTH,0,SPR4PTL,0
+        dc.w SPR5PTH,0,SPR5PTL,0
+        dc.w SPR6PTH,0,SPR6PTL,0
+        dc.w SPR7PTH,0,SPR7PTL,0
+        dc.w COLOR17,$A50,COLOR18,$FB3,COLOR19,$FFD,COLOR21,$924
+        dc.w COLOR22,$E5A,COLOR23,$FCE,COLOR25,$146,COLOR26,$4AF
+        dc.w COLOR27,$CEF,COLOR29,$113,COLOR30,$35A,COLOR31,$8BE
+
 ; Colour work per raster line (tools/gen_tables.py copper). In the logo band COLOR00 and
 ; COLOR04 get a gradient on every row; below it the palette is reloaded: COLOR01 is the
 ; mid-distance star, COLOR04/05 the far and near stars, and any index with bitplane 1 or 3
@@ -1396,6 +1770,8 @@ cop_bars:                                   ; 34 rows of WAIT + COLOR00, 8 bytes
         dc.w $2B01,$FFFE,COLOR00,$0424
         dc.w $FFFF,$FFFE
 
+        cnop 0,4
+sprites:    ds.b SPR_BYTES*SPR_PAGES    ; prebuilt sprite pages: per sprite one for each ball size
         cnop 0,4
         dc.l 0                      ; the word fetched left of line 0 (planes start 2 bytes early)
 screen:     ds.b PLANE_SIZE*6   ; plane 0 | plane 1 buffers 0,1 | plane 2 | plane 3 buffers 0,1

@@ -212,7 +212,7 @@ for rel,n,scope,tok,code in refs:
 # --- data_c payload is only ever reached through the relocation table -------
 # A direct code reference to a chipdata label would bake in a link time address
 # and survive the copy into chip RAM, so only the reloc table may name them.
-chip_labels=['screen','logo_data','font_data','audio_silence','mod_data','copper','cop_bpl1','cop_raster_color','cop_wave','cop_bars']
+chip_labels=['screen','logo_data','font_data','audio_silence','mod_data','copper','cop_bpl1','cop_raster_color','cop_wave','cop_bars','sprites','cop_spr']
 for label in chip_labels:
     for n,line in enumerate(main_src.splitlines(),1):
         code=line.split(';',1)[0]
