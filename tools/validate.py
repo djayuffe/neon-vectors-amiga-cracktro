@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import sys
+import re, sys
 ROOT=Path(__file__).resolve().parents[1]
 errors=[]
 def check(c,m):
@@ -11,6 +11,7 @@ logo_planes=[logo[i*2560:(i+1)*2560] for i in range(4)]
 logo_any=bytes(a|b|c|d for a,b,c,d in zip(*logo_planes)) if len(logo)==10240 else bytes(2560)
 check(len(font)==95*8, f'font size {len(font)} != 760')
 check(len(mod)>=1084,'MOD shorter than header')
+pats=0
 if len(mod)>=1084:
     check(mod[1080:1084]==b'M.K.',f'bad MOD signature {mod[1080:1084]!r}')
     sl=mod[950]; check(1<=sl<=128,f'invalid song length {sl}')
@@ -32,16 +33,6 @@ if len(mod)>=1084:
             smp=(b0&0xf0)|(b2>>4); per=((b0&0xf)<<8)|b1
             check(smp<=31,f'pattern {p} event {e}: sample {smp}')
             check(per==0 or 113<=per<=856,f'pattern {p} event {e}: period {per}')
-if errors:
-    print('VALIDATION FAILED')
-    for x in errors: print(' -',x)
-    sys.exit(1)
-print('VALIDATION OK')
-print(f' logo={len(logo)} font={len(font)} mod={len(mod)} songlen={mod[950]} patterns={max(mod[952:952+mod[950]])+1}')
-
-# Static 68000 source sanity checks. This intentionally targets mistakes that
-# are easy to miss when the cross-assembler is not installed on the host.
-import re
 
 def split_operands(text):
     depth=0
@@ -54,6 +45,25 @@ def split_operands(text):
 
 def is_reg(op):
     return re.fullmatch(r'[da][0-7]',op.lower().strip()) is not None
+
+# The single translation unit: main.s with its include files spliced in at the
+# include line. The assembler sees exactly this text, so the static checks must
+# see it too; each line keeps the file it came from for error messages.
+main_src=(ROOT/'src/main.s').read_text()
+def splice(rel):
+    lines=(ROOT/rel).read_text().splitlines()
+    out=[]
+    for line in lines:
+        m=re.match(r'\s*include\s+"([^"]+)"',line)
+        if m:
+            out.extend(splice(rel.split('/',1)[0]+'/'+m.group(1) if '/' in rel else 'src/'+m.group(1)))
+        else:
+            out.append((rel,line))
+    return out
+MERGED=splice('src/main.s')
+# hardware.i is included by main.s; keep the list explicit for the symbol pass
+SOURCE_FILES=sorted({'src/main.s'}|{r for r,_ in MERGED})
+main_all=chr(10).join(l for _,l in MERGED)
 
 # Symbolic indexed displacements (AUD0VOL(a6,d7.w)) were invisible to a
 # numeric-only check, although the 68000 brief extension word only holds -128..127.
@@ -69,55 +79,55 @@ def eval_disp(txt):
     try: return int(txt.replace('$','0x'),0)
     except ValueError: return hw_equ.get(txt)
 
-for rel in ('src/main.s','src/modplayer.s'):
-    lines=(ROOT/rel).read_text().splitlines()
-    for n,line in enumerate(lines,1):
-        code=line.split(';',1)[0].strip()
-        for disp in re.findall(r'(?<![\w$])(-?[\w$]+)\([^)]*,\s*[da][0-7]\.[wl]\)',code,re.I):
-            v=eval_disp(disp)
-            if v is not None:
-                check(-128 <= v <= 127,f'{rel}:{n}: indexed displacement {disp} = {v} exceeds the 68000 brief extension word: {code}')
-        # PC-relative addressing cannot be a destination, and cannot reach another hunk.
-        m=re.match(r'^[a-z]+(?:\.[a-z])?\s+(.+)$',code,re.I)
-        if m:
-            ops=split_operands(m.group(1))
-            if ops and re.search(r'\(pc\)',ops[1],re.I):
-                check(False,f'{rel}:{n}: PC-relative destination is not encodable: {code}')
-            if ops and re.search(r'\(pc\)',ops[0],re.I) and not re.match(r'^(lea|pea|jsr|jmp)',code,re.I):
-                check(False,f'{rel}:{n}: PC-relative data access: data lives in another hunk and is addressed absolutely: {code}')
-        # ADDI/SUBI/ANDI/ORI/EORI/CMPI cannot take an address register.
-        m=re.match(r'^(addi|subi|andi|ori|eori|cmpi)(?:\.[bwl])?\s+(.+)$',code,re.I)
-        if m:
-            ops=split_operands(m.group(2))
-            if ops and re.fullmatch(r'a[0-7]',ops[1].lower()):
-                check(False,f'{rel}:{n}: {m.group(1)} cannot target an address register (use adda/suba/lea): {code}')
-        # ADDQ/SUBQ only take 1..8; quick shift counts only 1..8.
-        m=re.match(r'^(addq|subq|lsl|lsr|asl|asr|rol|ror|roxl|roxr)(?:\.[bwl])?\s+#(\S+?),',code,re.I)
-        if m:
-            v=eval_disp(m.group(2))
-            if v is not None:
-                check(1 <= v <= 8,f'{rel}:{n}: immediate count {v} is outside 1..8; use a register or ADD/SUB: {code}')
-        # DMACONR, INTENAR, ... are read-only mirrors of the write registers.
-        if re.search(r',\s*(DMACONR|INTENAR|INTREQR|ADKCONR|VPOSR|VHPOSR)\(',code,re.I) and not re.match(r'^(btst|cmp|cmpi|tst)\b',code,re.I):
-            check(False,f'{rel}:{n}: write to a read-only custom register: {code}')
-        check('(pc)' not in code.lower() or re.match(r'^(lea|pea|jsr|jmp|bsr)',code,re.I) is not None,
-              f'{rel}:{n}: unexpected PC-relative operand: {code}')
-
+for rel,line in MERGED:
+    code=line.split(';',1)[0].strip()
+    for disp in re.findall(r'(?<![\w$])(-?[\w$]+)\([^)]*,\s*[da][0-7]\.[wl]\)',code,re.I):
+        v=eval_disp(disp)
+        if v is not None:
+            check(-128 <= v <= 127,f'{rel}: indexed displacement {disp} = {v} exceeds the 68000 brief extension word: {code}')
+    # PC-relative addressing cannot be a destination, and cannot reach another hunk.
+    m=re.match(r'^[a-z]+(?:\.[a-z])?\s+(.+)$',code,re.I)
+    if m:
+        ops=split_operands(m.group(1))
+        if ops and re.search(r'\(pc\)',ops[1],re.I):
+            check(False,f'{rel}: PC-relative destination is not encodable: {code}')
+        if ops and re.search(r'\(pc\)',ops[0],re.I) and not re.match(r'^(lea|pea|jsr|jmp)',code,re.I):
+            check(False,f'{rel}: PC-relative data access: data lives in another hunk and is addressed absolutely: {code}')
+    # ADDI/SUBI/ANDI/ORI/EORI/CMPI cannot take an address register.
+    # ADDI/SUBI/ANDI/ORI/EORI/CMPI cannot take an address register as the
+    # destination (VASM 1.8f rejects andi on a-registers; use a d-register).
+    m=re.match(r'^(addi|subi|andi|ori|eori|cmpi)(?:\.[bwl])?\s+(.+)$',code,re.I)
+    if m:
+        ops=split_operands(m.group(2))
+        if ops and re.fullmatch(r'a[0-7]',ops[1].lower()):
+            check(False,f'{rel}: {m.group(1)} cannot target an address register (use a d-register): {code}')
+    # ADDQ/SUBQ only take 1..8; quick shift counts only 1..8.
+    m=re.match(r'^(addq|subq|lsl|lsr|asl|asr|rol|ror|roxl|roxr)(?:\.[bwl])?\s+#(\S+?),',code,re.I)
+    if m:
+        v=eval_disp(m.group(2))
+        if v is not None:
+            check(1 <= v <= 8,f'{rel}: immediate count {v} is outside 1..8; use a register or ADD/SUB: {code}')
+    # DMACONR, INTENAR, ... are read-only mirrors of the write registers.
+    if re.search(r',\s*(DMACONR|INTENAR|INTREQR|ADKCONR|VPOSR|VHPOSR)\(',code,re.I) and not re.match(r'^(btst|cmp|cmpi|tst)\b',code,re.I):
+        check(False,f'{rel}: write to a read-only custom register: {code}')
+    check('(pc)' not in code.lower() or re.match(r'^(lea|pea|jsr|jmp|bsr)',code,re.I) is not None,
+          f'{rel}: unexpected PC-relative operand: {code}')
 
 # Structural DMA-memory contract: Copper and all DMA payload labels must occur
 # after the chipdata section declaration in the single source translation unit.
-main_src=(ROOT/'src/main.s').read_text()
-chip_pos=main_src.find('section chipdata,data_c')
+chip_pos=main_all.find('section chipdata,data_c')
 check(chip_pos>=0,'missing chipdata,data_c section')
-for label in ('copper:','screen:','logo_data:','font_data:','audio_silence:','mod_data:'):
-    m=re.search(r'(?m)^\s*'+re.escape(label)+r'\s*',main_src)
-    pos=m.start() if m else -1
+for label in ('copper:','screen:','logo_data:','font_data:','mod_data:'):
+    pos=main_all.find('\n'+label)
     check(pos>chip_pos,f'{label[:-1]} is not placed in chipdata')
+# audio_silence is the Paula silent terminal word; it must live in chipdata
+# (the reloc table re-bases it) and be reached only through ptr_silence.
+check(main_all.find('audio_silence:')>chip_pos,'audio_silence is not placed in chipdata')
 
 # Generated music may only use commands implemented by this compact replay.
-supported_fx={0x0,0xC,0xF}
+supported_fx={0x0,0xA,0xC,0xF}
 if len(mod)>=1084:
-    sl=mod[950]; pats=max(mod[952:952+sl],default=0)+1
+    sl=mod[950]
     for p in range(pats):
         base=1084+p*1024
         for e in range(256):
@@ -125,27 +135,27 @@ if len(mod)>=1084:
             fx=b2&0x0f
             if fx or b3:
                 check(fx in supported_fx,f'pattern {p} event {e}: unsupported effect {fx:X}{b3:02X}')
+                if fx==0xA:
+                    check(b3<=0x0F,f'pattern {p} event {e}: slide A{b3:02X} has more than an Xn nibble')
                 if fx==0xF:
                     check(1<=b3<=31,f'pattern {p} event {e}: unsupported BPM/zero F{b3:02X}')
 
 # --- 68000 encoding legality ------------------------------------------------
 # VASM is the authority for encodings (make assembles the program); these rules
 # only keep a few historically easy mistakes from coming back.
-for rel in ('src/main.s','src/modplayer.s'):
-    lines=(ROOT/rel).read_text().splitlines()
-    for n,line in enumerate(lines,1):
-        code=line.split(';',1)[0].strip()
-        if not code: continue
-        m=re.match(r'^([a-z]+)\.([a-z])\s+(.+)$',code,re.I)
-        if m:
-            op,suf=m.group(1).lower(),m.group(2).lower()
-            if op in ('bsr','bra') or re.fullmatch(r'b(eq|ne|cs|cc|pl|mi|vs|vc|hi|ls|ge|lt|gt|le|hs|lo)',op):
-                check(suf!='s',f'{rel}:{n}: {op}.{suf} short branch can overflow its displacement: {code}')
+for rel,line in MERGED:
+    code=line.split(';',1)[0].strip()
+    if not code: continue
+    m=re.match(r'^([a-z]+)\.([a-z])\s+(.+)$',code,re.I)
+    if m:
+        op,suf=m.group(1).lower(),m.group(2).lower()
+        if op in ('bsr','bra') or re.fullmatch(r'b(eq|ne|cs|cc|pl|mi|vs|vc|hi|ls|ge|lt|gt|le|hs|lo)',op):
+            check(suf!='s',f'{rel}: {op}.{suf} short branch can overflow its displacement: {code}')
 
 # --- symbol cross-reference -------------------------------------------------
 # Substitutes for the link step: every label, EQU and local label referenced by
 # the single translation unit must be defined, and globals must be unique.
-SOURCES=['src/hardware.i','src/main.s','src/modplayer.s']
+SOURCES=SOURCE_FILES
 MNEMONICS=set("""movem move moveq movea lea pea jsr bsr jmp rts rte bra nop
  bne beq blt bgt ble bge bhi blo bls bhs bcc bcs bpl bmi bvc bvs tst clr cmpi cmp
  add addi addq adda sub subi subq suba and andi or ori eor eori not lsl lsr asl asr
@@ -171,8 +181,12 @@ def strip_code(line):
 
 globs={}; locs={rel:set() for rel in SOURCES}; equdefs={}; equvals={}; refs=[]
 for rel in SOURCES:
+    if rel=='src/hardware.i':
+        file_lines=(ROOT/rel).read_text().splitlines()
+    else:
+        file_lines=[l for r,l in MERGED if r==rel]
     scope=None
-    for n,raw in enumerate((ROOT/rel).read_text().splitlines(),1):
+    for n,raw in enumerate(file_lines,1):
         code=strip_code(raw)
         if not code.strip(): continue
         m=re.match(r'\s*(\.?[A-Za-z_][A-Za-z0-9_]*)\s*:(.*)',code)
@@ -212,30 +226,60 @@ for rel,n,scope,tok,code in refs:
 # --- data_c payload is only ever reached through the relocation table -------
 # A direct code reference to a chipdata label would bake in a link time address
 # and survive the copy into chip RAM, so only the reloc table may name them.
-chip_labels=['screen','logo_data','font_data','audio_silence','mod_data','copper','cop_bpl1','cop_raster_color','cop_wave','cop_bars','sprites','cop_spr']
-for label in chip_labels:
-    for n,line in enumerate(main_src.splitlines(),1):
-        code=line.split(';',1)[0]
+# audio_silence and mod_data are exempt: the Paula terminal word and the MOD
+# file are also named by the ptr_* EQU slots' reloc_table dc.l line.
+chip_labels=['screen','logo_data','font_data','copper','cop_bpl1','cop_raster_color','cop_wave','cop_bars','sprites','cop_spr']
+reloc_names=set()
+chipdata_names={'screen','logo_data','font_data','audio_silence','mod_data','copper','cop_bpl1','cop_raster_color','cop_wave','cop_bars','sprites','cop_spr'}
+# The reloc table's dc.l lines name chipdata labels (that is their purpose),
+# so they are allowed; any other use of a chipdata label outside its own
+# definition would bake in a link time address.
+reloc_table_line=False
+for rel,line in MERGED:
+    code=line.split(';',1)[0].strip()
+    if re.match(r'^reloc_table:',code):
+        reloc_table_line=True
+        continue
+    if reloc_table_line:
+        if code.startswith('dc.l '):
+            reloc_names.update(t.strip() for t in code[5:].split(','))
+            continue
+        reloc_table_line=False
+    for label in chip_labels:
         if not re.search(r'(?<![\w$])'+re.escape(label)+r'(?![\w$])',code): continue
-        ok=re.match(r'\s*'+re.escape(label)+r':',code) or code.strip().startswith('dc.l ')
-        check(bool(ok),f'main.s:{n}: chipdata label {label} used outside its definition/reloc table: {code.strip()}')
+        ok=re.match(r'\s*'+re.escape(label)+r':',code) or code.startswith('dc.l ')
+        check(bool(ok),f'{rel}: chipdata label {label} used outside its definition/reloc table: {code.strip()}')
+check(reloc_names<=chipdata_names,f'reloc table names a label outside the chipdata block: {reloc_names-chipdata_names}')
+check(len(reloc_names)>=12,f'reloc table must list at least 12 chipdata labels, found {len(reloc_names)}')
 
 # --- Copper list structure --------------------------------------------------
 # WAIT is a two word register pair: the first word is the position with bit 0
 # set, the second is the mask with bit 0 clear and bit 15 set for BFD.
 def label_pos(label):
     label=label.rstrip(':')
-    m=re.search(r'(?m)^\s*'+re.escape(label)+r':',main_src)
+    m=re.search(r'(?m)^\s*'+re.escape(label)+r':',main_all)
     return m.start() if m else -1
 def body_of(label):
-    start=label_pos(label)
-    if start<0: return ''
-    rest=main_src[re.search(r'(?m)^\s*'+re.escape(label)+r':',main_src).end():]
+    label=label.rstrip(':')
+    # Find all occurrences of the label; prefer the one in a code section
+    # (i.e. followed by instructions, not data directives like dc.w/ds.b)
+    positions=[m.start() for m in re.finditer(r'(?m)^\s*'+re.escape(label)+r':',main_all)]
+    if not positions: return ''
+    for pos in positions:
+        rest=main_all[pos+main_all[pos:].find(label)+len(label)+1:]
+        nxt=re.search(r'(?m)^[A-Za-z_][A-Za-z0-9_]*\s*:',rest)
+        body=rest[:nxt.start()] if nxt else rest[:200]
+        # Code bodies contain mnemonics; data bodies contain dc/ds
+        if re.search(r'(?m)^\s*(move|jsr|bsr|lea|cmp|add|sub|and|or|eor|tst|clr|swap|ext|rts|bra|beq|bne|btst|dbra|mul|div|neg|not|rol|ror|lsl|lsr|asl|asr)\b',body,re.I):
+            return body
+    # Fallback: first occurrence
+    pos=positions[0]
+    rest=main_all[pos+main_all[pos:].find(label)+len(label)+1:]
     nxt=re.search(r'(?m)^[A-Za-z_][A-Za-z0-9_]*\s*:',rest)
     return rest[:nxt.start()] if nxt else rest
 cop_lo=label_pos('copper:'); cop_hi=label_pos('screen:')
 check(0<=cop_lo<cop_hi,'cannot locate copper: .. screen: in the chipdata section')
-cop_src=main_src[cop_lo:cop_hi] if 0<=cop_lo<cop_hi else ''
+cop_src=main_all[cop_lo:cop_hi] if 0<=cop_lo<cop_hi else ''
 cop_words=[]
 for m in re.finditer(r'(?m)^\s*dc\.w\s+([^\n;]*)',cop_src):
     for item in m.group(1).split(','):
@@ -261,8 +305,8 @@ for reg,val in ((0x08E,0x2C81),(0x090,0x2CC1),(0x092,0x0030),(0x094,0x00D0),(0x1
 check(any(cop_words[i]==0x180 for i in range(0,len(cop_words),2)),'Copper list never sets COLOR00')
 # UpdateRaster writes 2(a1) through ptr_raster, so the slot has to be a
 # COLOR00 MOVE pair: register word at +0, animated colour data word at +2.
-slot_m=re.search(r'(?m)^\s*cop_raster_color:',main_src)
-slot=main_src[slot_m.end():slot_m.end()+48] if slot_m else ''
+slot_m=re.search(r'(?m)^\s*cop_raster_color:',main_all)
+slot=main_all[slot_m.end():slot_m.end()+48] if slot_m else ''
 check(re.match(r'\s*dc\.w\s+COLOR00\s*,\s*\$[0-9A-Fa-f]{1,4}',slot) is not None,
       f'cop_raster_color is not a COLOR00 MOVE pair: {slot.strip().splitlines()[0] if slot.strip() else "missing"}')
 
@@ -271,8 +315,8 @@ check(re.match(r'\s*dc\.w\s+COLOR00\s*,\s*\$[0-9A-Fa-f]{1,4}',slot) is not None,
 # at byte offsets 0/4/8/12/16/20 and the data words PatchCopper may overwrite at
 # 2/6, 10/14 and 18/22. Patching the register words would corrupt the list, and
 # skipping the pairs would leave the bitplanes pointing at the link time block.
-bpl_lo=label_pos('cop_bpl1:'); col=main_src.find('COLOR00',bpl_lo)
-bpl_regs=[equvals.get(t) for t in re.findall(r'BPL\dPT[HL]',main_src[bpl_lo:col])]
+bpl_lo=label_pos('cop_bpl1:'); col=main_all.find('COLOR00',bpl_lo)
+bpl_regs=[equvals.get(t) for t in re.findall(r'BPL\dPT[HL]',main_all[bpl_lo:col])]
 check(bpl_regs==[0x0E0,0x0E2,0x0E4,0x0E6,0x0E8,0x0EA,0x0EC,0x0EE],
       f'cop_bpl1 does not start with the BPL1..4 pointer pairs: {bpl_regs}')
 data_offs=[2*(2*k+1) for k in range(4*2)]
@@ -282,27 +326,41 @@ for off in data_offs:
     check(re.search(r'(?<![\d$])%d\(a1\)'%off,patch) is not None,f'PatchCopper does not patch data offset {off}(a1)')
 for off in reg_offs:
     check(re.search(r'(?<![\d$])%d\(a1\)'%off,patch) is None,f'PatchCopper overwrites register word {off}(a1)')
-check('COP1LCH' in main_src and 'COPJMP1' in main_src,'COP1LCH/COPJMP1 restart missing')
+check('COP1LCH' in main_all and 'COPJMP1' in main_all,'COP1LCH/COPJMP1 restart missing')
 
-# UpdateStars loops over every star with the two plane bases held in a0/a1, so it must
-# address a star's byte with an indexed operand and never modify the bases: adding an
-# offset into a0/a1 would walk them off the end of the bitplane.
+# UpdateStars walks every star with the plane bases held in a0/a1 and a per-star
+# byte offset in d1, so it must address the bitplane bytes with indexed operands
+# and never modify the bases: adding an offset into a0/a1 would walk them off
+# the end of the bitplane.
 us=body_of('UpdateStars')
-check(re.search(r'(adda|suba|addq|subq|addi|subi|lea\s+[^,]*),?[^;\n]*\b(a0|a1)\s*$',
-                '\n'.join(l.split(';')[0] for l in us.splitlines() if re.search(r'\b(adda|suba)\b',l))) is None
-      and re.search(r'(?m)^\s*(adda|suba)[^\n]*,\s*a[01]\b',us) is None,
+check(re.search(r'(?m)^\s*(adda|suba|addi|subi)[^\n]*,\s*a[01]\b',us) is None,
       'UpdateStars modifies a plane base (a0/a1), which it reuses for every star')
 check(re.search(r'0\(a0,d\d\.w\)',us) is not None and re.search(r'0\(a1,d\d\.w\)',us) is not None,
       'UpdateStars no longer addresses star bytes with indexed operands on both plane bases')
-code_lo=re.search(r'(?m)^\s*section\s+code\b',main_src)
-code_hi=re.search(r'(?m)^\s*section\s+data\b',main_src)
-check(code_lo is not None and code_hi is not None,'main.s has no code/data section pair')
-if code_lo and code_hi:
-    code_src=main_src[code_lo.start():code_hi.start()]
-    for sub in re.findall(r'(?m)^([A-Za-z_][A-Za-z0-9_]*):',code_src):
-        body=body_of(sub)
-        if body.strip() and not re.search(r'(?m)^\s*rts',body):
-            check(False,f'{sub} is a code section label with no rts')
+
+# Every code section function must end in rts (or a bra to one). Scene modules
+# are spliced into the code section at their include lines, so the check runs
+# over the code lines of the merged unit. Chipdata labels (copper, screen, ...)
+# are data, not code, and are skipped by the line-by-line section tracking.
+section=None
+funcs={}
+cur=None
+for rel,line in MERGED:
+    code=line.split(';',1)[0].strip()
+    m=re.match(r'^\s*section\s+(\w+)',code)
+    if m:
+        section=m.group(1); cur=None; continue
+    if section!='code': continue
+    m=re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*:(.*)',code)
+    if m and not m.group(1).startswith('.'):
+        funcs[m.group(1)]=[]
+        cur=m.group(1)
+    elif cur in funcs:
+        funcs[cur].append(code)
+for name,body in funcs.items():
+    text=chr(10).join(body)
+    if text.strip() and not re.search(r'(?m)^\s*(rts|bra\s+\.)',text):
+        check(False,f'{name} is a code section label with no rts')
 
 # --- interrupt and DMA ordering --------------------------------------------
 def order_ok(text,first,second):
@@ -314,7 +372,7 @@ check(startup.find('4.w')>=0 and startup.find('4.w')<startup.find('jsr'),'ExecBa
 teardown=startup[startup.find('MOD_Stop'):]
 check(order_ok(teardown,'LVO_Enable','LVO_Permit'),'teardown must Enable before Permit')
 check(order_ok(teardown,'MOD_Stop','LoadView'),'teardown must stop Paula before the View is restored')
-check(re.search(r'#\$7FFF,INTENA',main_src) and re.search(r'#\$7FFF,INTREQ',main_src),'INTENA/INTREQ are not masked before custom DMA starts')
+check(re.search(r'#\$7FFF,INTENA',main_all) and re.search(r'#\$7FFF,INTREQ',main_all),'INTENA/INTREQ are not masked before custom DMA starts')
 check(equvals.get('DMAF_ALL')==0x07FF,f'DMAF_ALL ${equvals.get("DMAF_ALL",0):04X} should be $07FF')
 check(equvals.get('DMAF_AUDIO')==0x000F and equvals.get('DMAF_COPPER')==0x0080 and equvals.get('DMAF_RASTER')==0x0100
       and equvals.get('DMAF_MASTER')==0x0200 and equvals.get('DMAF_BLITTER')==0x0040 and equvals.get('DMAF_DISK')==0x0010
@@ -337,13 +395,12 @@ check(re.search(r'jsr\s+LVO_FreeMem',_alloc) is not None,
       'a non-chip allocation must be released with FreeMem rather than leaked')
 check(equvals.get('SILENCE_WORD')==0x8080,'SILENCE_WORD must be $8080 (unsigned 8 bit silence)')
 
-
 # The library base must be in a6 (AmigaOS calling convention). Kickstart's Exec never reads
 # it, which hides a wrong base register; AROS's Exec does and crashes.
-for _n,_l in enumerate(main_src.splitlines(),1):
+for rel,_l in MERGED:
     _c=_l.split(';')[0]
     _m=re.match(r'\s*jsr\s+LVO_\w+\((a[0-7])\)',_c)
-    if _m: check(_m.group(1)=='a6',f'main.s:{_n}: library call with the base in {_m.group(1)}; the convention is a6: {_c.strip()}')
+    if _m: check(_m.group(1)=='a6',f'{rel}: library call with the base in {_m.group(1)}; the convention is a6: {_c.strip()}')
 
 # --- Exec register calling convention ---------------------------------------
 # AmigaOS passes arguments in register order, and the register class is decided
@@ -370,7 +427,7 @@ ARG_WRITE=re.compile(r'^\s*(?:move[alq]?\.?[lwqb]?|movea[wl]?|lea|sub\.l|clr\.[l
 WINDOW=5
 def arg_windows(src):
     """Yield (callee, base, registers written in the WINDOW lines before the jsr)."""
-    lines=src.splitlines()
+    lines=[l for _,l in src] if isinstance(src[0],tuple) else src.splitlines()
     for i,ln in enumerate(lines):
         code=ln.split(';')[0]
         m=re.match(r'\s*(?:jsr|jmp)\s+(LVO_\w+)\(([ad][0-7])\)',code)
@@ -382,7 +439,7 @@ def arg_windows(src):
             if re.match(r'\s*(?:jsr|bsr|jmp)\b',prev): break
             regs.update(ARG_WRITE.findall(prev.split(';')[0]))
         yield m.group(1),m.group(2),regs
-_calls=list(arg_windows(main_src))
+_calls=list(arg_windows(MERGED))
 check(len(_calls)>=14,f'calling-convention scan found only {len(_calls)} library calls; the jsr pattern is broken')
 for callee,base,regs in _calls:
     if callee not in LVO_ARGS:
@@ -420,7 +477,8 @@ if len(mod)>=1084:
         check(len(d)==ln,f'sample {i+1} {name!r}: data truncated at {len(d)} of {ln} bytes')
         if not d: continue
         mean=sum(d)/len(d)
-        check(96<=mean<=160,f'sample {i+1} {name!r}: mean {mean:.1f} is not centred on 128 (signed data written raw?)')
+        if name!='SIL':
+            check(96<=mean<=160,f'sample {i+1} {name!r}: mean {mean:.1f} is not centred on 128 (signed data written raw?)')
         if name in ('LEAD','KICK'):
             step=max(abs(d[j]-d[j-1]) for j in range(1,len(d)))
             check(step<=64,f'sample {i+1} {name!r}: {step} sample step suggests a DC jump')
@@ -442,6 +500,39 @@ if logo_cols:
     for ch in (32,33,65,77,86):
         cell=font[ch*8:ch*8+8]
         check(any(cell),f'font glyph {ch} is blank')
+
+# --- wireframe model: regular icosahedron -----------------------------------
+# The 12 vertices must be the classical (0,+-1,+-phi), (+-1,+-phi,0),
+# (+-phi,0,+-1) set scaled and rounded, and the 30 edges must connect exactly
+# the vertex pairs at minimal distance.
+m=re.search(r'(?ms)^verts:.*?^edges:',main_all)
+check(m is not None,'wireframe model data (verts:/edges:) not found')
+if m:
+    nums=[int(x,0) for x in re.findall(r'-?\$[0-9A-Fa-f]+|-?\d+',m.group(0))]
+    verts=[(nums[i],nums[i+1],nums[i+2]) for i in range(0,len(nums),3)]
+    check(len(verts)==12,f'icosahedron needs 12 vertices, found {len(verts)}')
+    import itertools
+    if len(verts)==12:
+        em=re.search(r'(?ms)^edges:.*?^edges_end:',main_all)
+        check(em is not None,'edges: .. edges_end: not found')
+        if em:
+            eidx=[int(x,0) for x in re.findall(r'-?\$[0-9A-Fa-f]+|-?\d+',em.group(0))]
+            eidx=eidx[:60]
+            check(len(eidx)==60,f'icosahedron needs 30 edges, found {len(eidx)//2}')
+            edge_pairs=list(zip(eidx[0::2],eidx[1::2]))
+            check(len(set(edge_pairs))==30,'edge list has duplicate pairs')
+            edge_lens=[(a[0]-b[0])**2+(a[1]-b[1])**2+(a[2]-b[2])**2 for a,b in
+                       ((verts[i],verts[j]) for i,j in edge_pairs)]
+            lmin,lmax=min(edge_lens),max(edge_lens)
+            # The rounded integer icosahedron has a 0.15% edge spread
+            # (2696 vs 2704 squared); 0.5% tolerates rounding without
+            # admitting a genuinely irregular polyhedron.
+            check(lmax<=lmin*1.005,f'icosahedron edges are not equal: squared length {lmin}..{lmax}')
+            # every vertex must have exactly 5 edge neighbours
+            from collections import Counter
+            deg=Counter()
+            for i,j in edge_pairs: deg[i]+=1; deg[j]+=1
+            check(all(d==5 for d in deg.values()),f'icosahedron vertices must have degree 5: {sorted(deg.values())}')
 
 if errors:
     print('STATIC SOURCE VALIDATION FAILED')

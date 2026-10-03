@@ -2,8 +2,9 @@ PYTHON ?= python3
 VASM ?= $(shell command -v vasmm68k_mot 2>/dev/null || true)
 LOCAL_VASM := tools/bin/vasmm68k_mot
 VASMFLAGS = -m68000 -kick1hunks -Fhunkexe -nosym -I./src
+SPLICE = build/merged.s
 TARGET = build/neon_vectors
-SRCS = src/main.s src/hardware.i src/modplayer.s
+SRCS = src/main.s src/hardware.i src/modplayer.s src/system.s src/copper.s src/scene_logo.s src/scene_stars.s src/scene_wire.s src/scene_scroller.s src/scene_sprites.s src/scene_copperbars.s
 GEN = tools/generate_assets.py
 # The generated assets are checked in, so they are only rebuilt when the
 # generator changes. A stamp instead of a phony per-file target keeps "make -j"
@@ -54,8 +55,9 @@ toolchain:
 	@tools/bootstrap_vasm.sh >/dev/null
 
 $(TARGET): $(CHECKED) $(SRCS) | build
-	@if [ -n "$(VASM)" ]; then A="$(VASM)"; elif [ -x "$(LOCAL_VASM)" ]; then A="$(LOCAL_VASM)"; else echo "No VASM. Run 'make toolchain' after supplying tools/vendor/vasm, or install vasmm68k_mot."; exit 2; fi; \
-	$$A $(VASMFLAGS) -o $@ src/main.s
+	@$(PYTHON) tools/splice.py src/main.s $(SPLICE); \
+	if [ -n "$(VASM)" ]; then A="$(VASM)"; elif [ -x "$(LOCAL_VASM)" ]; then A="$(LOCAL_VASM)"; else echo "No VASM. Run 'make toolchain' after supplying tools/vendor/vasm, or install vasmm68k_mot."; exit 2; fi; \
+	$$A $(VASMFLAGS) -o $@ $(SPLICE)
 
 hunkcheck: $(TARGET)
 	$(PYTHON) tools/hunkcheck.py $(TARGET)

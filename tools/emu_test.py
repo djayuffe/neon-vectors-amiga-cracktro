@@ -80,8 +80,14 @@ def find_vasm():
 
 
 def assemble(out):
+    # Splice includes into a single file (VASM 1.8f kick1hunks cannot resolve
+    # forward symbols across include boundaries).
+    merged = out.with_suffix('.merged.s')
+    subprocess.run([sys.executable, str(ROOT / 'tools/splice.py'),
+                    str(ROOT / 'src/main.s'), str(merged)],
+                   check=True, capture_output=True, cwd=ROOT)
     r = subprocess.run([find_vasm(), '-m68000', '-kick1hunks', '-Fhunkexe', '-I', str(ROOT / 'src'),
-                        '-o', str(out), str(ROOT / 'src/main.s')], capture_output=True, text=True, cwd=ROOT)
+                        '-o', str(out), str(merged)], capture_output=True, text=True, cwd=ROOT)
     if r.returncode:
         sys.exit('emu_test: assembly failed\n' + r.stdout + r.stderr)
 
@@ -444,7 +450,7 @@ class Amiga:
         self.install()
         mem.w32(0, STACK)
         cpu.pulse_reset()
-        cpu.w_pc(self.bases[0]); cpu.w_reg(R.A7, STACK - 4)
+        cpu.w_pc(self.bases[0] + self.sym('_start')); cpu.w_reg(R.A7, STACK - 4)
         mem.w32(STACK - 4, SENTINEL)
         sentinel_regs = [0x11110000 + i for i in range(1, 8)] + [0x22220000 + i for i in range(7)]
         for i in range(1, 8):
@@ -496,7 +502,7 @@ class Amiga:
                     self.snapshot = self.render()
                 if n == frames:
                     mem.w8(CIAAPRA, 0xFF & ~0x40)      # press the left mouse button
-            n = cpu.execute(1).cycles
+            n = cpu.execute(1)
             self.t += n
             steps += 1
             self.beam()
