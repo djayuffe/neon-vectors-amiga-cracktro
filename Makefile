@@ -15,7 +15,7 @@ STAMP = assets/.generated
 # failing check stops make before the assembler is invoked.
 CHECKED = build/.validated
 
-all: $(TARGET) hunkcheck
+all: $(TARGET) hunkcheck adf
 
 $(STAMP): $(GEN)
 	@mkdir -p assets
@@ -62,6 +62,9 @@ $(TARGET): $(CHECKED) $(SRCS) | build
 hunkcheck: $(TARGET)
 	$(PYTHON) tools/hunkcheck.py $(TARGET)
 
+adf: $(TARGET)
+	$(PYTHON) tools/make_adf.py
+
 build:
 	@mkdir -p build
 
@@ -79,4 +82,4 @@ distclean: clean
 
 release: clean all verify-repro manifest
 
-.PHONY: all assets validate mutants verify-repro emutest emu-mutants manifest toolchain hunkcheck clean distclean release
+.PHONY: all assets validate mutants verify-repro emutest emu-mutants manifest toolchain hunkcheck adf clean distclean release
